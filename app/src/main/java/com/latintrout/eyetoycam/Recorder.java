@@ -24,14 +24,14 @@ import android.provider.MediaStore;
 import android.view.Surface;
 
 import java.nio.ByteBuffer;
-import java.text.SimpleDateFormat;
-import java.util.Date;
 import java.util.Locale;
 
 /**
- * Records the EyeToy picture to an MP4 (H.264 video + AAC audio) in Movies/EyeToyCam.
- * Video frames are drawn onto the encoder's input surface as they arrive, so the
- * video keeps the camera's real timing even when its frame rate changes.
+ * Records the EyeToy picture to an MP4 in Movies/EyeToyCam.
+ *
+ * Normal mode: H.264 video + AAC sound, frames timed by the real clock.
+ * Time-lapse mode: no sound; every frame handed in becomes one frame of a
+ * fixed-speed video, however long it was since the last one.
  */
 final class Recorder {
 
@@ -42,6 +42,7 @@ final class Recorder {
     private final Logger log;
     private final Object muxLock = new Object();
     private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final Rect dst = new Rect();
 
     private MediaCodec venc, aenc;
     private Surface inSurface;
@@ -52,33 +53,53 @@ final class Recorder {
     private String fileName;
     private AudioRecord audio;
     private Thread videoThread, audioThread;
+    private Look look;
 
     private int vTrack = -1, aTrack = -1;
     private boolean muxStarted;
     private boolean withAudio;
     private volatile boolean running;
+    private boolean timelapse;
+    private int outFps = 30;
     private long startNs;
     private int width, height;
-    private long videoSamples;
+    private volatile long videoSamples;
+    private volatile long framesDrawn;
+    private boolean saved;
 
     Recorder(Logger logger) { log = logger; }
 
     boolean isRunning() { return running; }
-
+    boolean isTimelapse() { return timelapse; }
+    long framesDrawn() { return framesDrawn; }
     long elapsedMs() { return running ? (System.nanoTime() - startNs) / 1_000_000 : 0; }
+    /** File name if the video was saved successfully, otherwise null. */
+    String savedName() { return saved ? fileName : null; }
 
-    void start(Context ctx, int w, int h, int fps, boolean wantAudio) throws Exception {
+    void start(Context ctx, int w, int h, int fps, boolean wantAudio, Look lk, String baseName,
+               String description, boolean tl, int timelapseFps) throws Exception {
         width = w;
         height = h;
+        look = lk;
+        timelapse = tl;
+        outFps = timelapseFps;
+        dst.set(0, 0, w, h);
         cr = ctx.getContentResolver();
-        fileName = "eyetoy_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".mp4";
+        fileName = baseName + ".mp4";
 
         ContentValues v = new ContentValues();
         v.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
+        v.put(MediaStore.Video.Media.TITLE, baseName);
         v.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
         v.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/EyeToyCam");
         v.put(MediaStore.Video.Media.IS_PENDING, 1);
-        uri = cr.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v);
+        try {
+            v.put(MediaStore.Video.Media.DESCRIPTION, description);
+            uri = cr.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v);
+        } catch (Exception e) {
+            v.remove(MediaStore.Video.Media.DESCRIPTION);
+            uri = cr.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v);
+        }
         if (uri == null) throw new Exception("couldn't create the video file");
         pfd = cr.openFileDescriptor(uri, "rw");
         if (pfd == null) throw new Exception("couldn't open the video file");
@@ -87,8 +108,8 @@ final class Recorder {
         // ---- video encoder ----
         MediaFormat vf = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h);
         vf.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-        vf.setInteger(MediaFormat.KEY_BIT_RATE, 2_500_000);
-        vf.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
+        vf.setInteger(MediaFormat.KEY_BIT_RATE, timelapse ? 4_000_000 : 2_500_000);
+        vf.setInteger(MediaFormat.KEY_FRAME_RATE, timelapse ? outFps : fps);
         vf.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
         venc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
         venc.configure(vf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
@@ -97,7 +118,7 @@ final class Recorder {
 
         // ---- audio ----
         withAudio = false;
-        if (wantAudio) {
+        if (wantAudio && !timelapse) {
             try {
                 startAudio(ctx);
                 withAudio = true;
@@ -109,6 +130,7 @@ final class Recorder {
 
         startNs = System.nanoTime();
         videoSamples = 0;
+        framesDrawn = 0;
         running = true;
         videoThread = new Thread(this::videoLoop, "video-enc");
         videoThread.start();
@@ -116,7 +138,8 @@ final class Recorder {
             audioThread = new Thread(this::audioLoop, "audio-enc");
             audioThread.start();
         }
-        log.log("Recording to Movies/EyeToyCam/" + fileName + (withAudio ? "" : " (no sound)"));
+        log.log((timelapse ? "Time-lapse" : "Recording") + " to Movies/EyeToyCam/" + fileName
+                + (withAudio || timelapse ? "" : " (no sound)"));
     }
 
     @SuppressWarnings("MissingPermission")
@@ -152,17 +175,22 @@ final class Recorder {
         audio.startRecording();
     }
 
-    /** Called from the frame thread for every decoded camera frame. */
+    /** Draws one camera frame into the video. */
     void drawFrame(Bitmap bmp) {
         if (!running) return;
         try {
             Canvas c = inSurface.lockHardwareCanvas();
             try {
                 c.drawColor(Color.BLACK);
-                c.drawBitmap(bmp, null, new Rect(0, 0, width, height), paint);
+                c.save();
+                c.scale(look.mirror ? -1f : 1f, look.flip ? -1f : 1f, width / 2f, height / 2f);
+                paint.setColorFilter(look.filter());
+                c.drawBitmap(bmp, null, dst, paint);
+                c.restore();
             } finally {
                 inSurface.unlockCanvasAndPost(c);
             }
+            framesDrawn++;
         } catch (Exception e) {
             // a dropped frame is not worth stopping the recording for
         }
@@ -220,13 +248,18 @@ final class Recorder {
                 ByteBuffer out = venc.getOutputBuffer(idx);
                 boolean config = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
                 if (!config && info.size > 0 && out != null && (muxStarted || waitForMuxer())) {
-                    if (base == Long.MIN_VALUE) {
-                        // surface timestamps normally share System.nanoTime's clock; if not, line them up
-                        long d = info.presentationTimeUs - startNs / 1000;
-                        base = (d >= 0 && d < 10_000_000L) ? startNs / 1000
-                                : info.presentationTimeUs - (System.nanoTime() - startNs) / 1000;
+                    if (timelapse) {
+                        // every frame lasts exactly 1/outFps, whatever the real gap was
+                        info.presentationTimeUs = videoSamples * 1_000_000L / outFps;
+                    } else {
+                        if (base == Long.MIN_VALUE) {
+                            // surface timestamps normally share System.nanoTime's clock; if not, line them up
+                            long d = info.presentationTimeUs - startNs / 1000;
+                            base = (d >= 0 && d < 10_000_000L) ? startNs / 1000
+                                    : info.presentationTimeUs - (System.nanoTime() - startNs) / 1000;
+                        }
+                        info.presentationTimeUs -= base;
                     }
-                    info.presentationTimeUs -= base;
                     if (info.presentationTimeUs > lastPts) {
                         lastPts = info.presentationTimeUs;
                         out.position(info.offset);
@@ -319,32 +352,38 @@ final class Recorder {
 
         boolean ok = false;
         try {
-            if (muxStarted && videoSamples > 0) {
+            if (muxer != null && muxStarted && videoSamples > 0) {
                 muxer.stop();
                 ok = true;
             }
         } catch (Exception e) {
             log.log("Finishing the video failed: " + e.getMessage());
         }
-        try { muxer.release(); } catch (Exception ignored) { }
+        try { if (muxer != null) muxer.release(); } catch (Exception ignored) { }
         muxer = null;
         muxStarted = false;
         vTrack = aTrack = -1;
-        try { venc.stop(); } catch (Exception ignored) { }
-        try { venc.release(); } catch (Exception ignored) { }
-        try { inSurface.release(); } catch (Exception ignored) { }
+        try { if (venc != null) venc.stop(); } catch (Exception ignored) { }
+        try { if (venc != null) venc.release(); } catch (Exception ignored) { }
+        try { if (inSurface != null) inSurface.release(); } catch (Exception ignored) { }
         venc = null;
         releaseAudio();
-        try { pfd.close(); } catch (Exception ignored) { }
+        try { if (pfd != null) pfd.close(); } catch (Exception ignored) { }
 
         if (ok) {
             ContentValues v = new ContentValues();
             v.put(MediaStore.Video.Media.IS_PENDING, 0);
-            cr.update(uri, v, null, null);
-            log.log(String.format(Locale.US, "Saved video Movies/EyeToyCam/%s (%d s, %d frames).",
-                    fileName, durMs / 1000, videoSamples));
+            try { cr.update(uri, v, null, null); } catch (Exception ignored) { }
+            saved = true;
+            if (timelapse) {
+                log.log(String.format(Locale.US, "Saved time-lapse Movies/EyeToyCam/%s (%d frames, %.1f s of video).",
+                        fileName, videoSamples, videoSamples / (double) outFps));
+            } else {
+                log.log(String.format(Locale.US, "Saved video Movies/EyeToyCam/%s (%d s, %d frames).",
+                        fileName, durMs / 1000, videoSamples));
+            }
         } else {
-            try { cr.delete(uri, null, null); } catch (Exception ignored) { }
+            try { if (uri != null) cr.delete(uri, null, null); } catch (Exception ignored) { }
             log.log("Recording had no frames, so nothing was saved.");
         }
     }

@@ -24,7 +24,9 @@ jobs:
           gradle-version: '8.10.2'
 
       - name: Build
-        run: gradle assembleDebug --stacktrace
+        run: |
+          set -o pipefail
+          gradle assembleDebug --console=plain --stacktrace 2>&1 | tee build.log
 
       - name: Rename APK
         run: cp app/build/outputs/apk/debug/app-debug.apk eyetoy-cam.apk
@@ -37,3 +39,16 @@ jobs:
           body: Install eyetoy-cam.apk on your phone.
           files: eyetoy-cam.apk
           make_latest: true
+
+      - name: Save build log to a branch
+        if: always()
+        run: |
+          cp build.log /tmp/build.log || echo "no log" > /tmp/build.log
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git checkout --orphan build-log
+          git rm -rf . -q || true
+          cp /tmp/build.log build.log
+          git add build.log
+          git commit -q -m "build log for run ${{ github.run_number }} (${{ job.status }})"
+          git push -f origin build-log

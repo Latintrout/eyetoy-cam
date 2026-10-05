@@ -313,7 +313,7 @@ final class EyeToyDriver {
             {0xff, 0x00},
     };
 
-    /** Configures VGA (640x480) at 15 or 30 fps and starts the image stream. */
+    /** Configures VGA (640x480) at 5, 10, 15 or 30 fps and starts the image stream. */
     void start(int fps) throws IOException {
         final int width = 640, height = 480;
         log.log("Configuring 640x480 @ " + fps + " fps...");
@@ -337,9 +337,17 @@ final class EyeToyDriver {
             if (fps >= 30) {
                 regW(0xa4, 0x0c);
                 regW(0x23, 0xff);
-            } else {                                          // 15 fps
+            } else if (fps >= 15) {
                 regW(0xa4, 0x04);
                 regW(0x23, 0xff);
+                clockdiv = 1;
+            } else if (fps >= 10) {
+                regW(0xa4, 0x04);
+                regW(0x23, 0x1f);
+                clockdiv = 1;
+            } else {                                          // 5 fps (gentle, for time-lapse)
+                regW(0xa4, 0x04);
+                regW(0x23, 0x1b);
                 clockdiv = 1;
             }
         }
@@ -405,7 +413,17 @@ final class EyeToyDriver {
         i2cWMask(0x12, 0x04, 0x06);
     }
 
-    void stop() {
+    /** Turns the camera's light on or off. Returns false if the camera didn't answer. */
+    synchronized boolean setLed(boolean on) {
+        try {
+            ledControl(on);
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    synchronized void stop() {
         try {
             regW(OV519_R51_RESET1, 0x0f);
             regW(OV519_R51_RESET1, 0x00);

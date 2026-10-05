@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Sony PS2 EyeToy (054c:0155) and its sibling ID 054c:0154 -->
+    <usb-device vendor-id="1356" product-id="341" />
+    <usb-device vendor-id="1356" product-id="340" />
+</resources>

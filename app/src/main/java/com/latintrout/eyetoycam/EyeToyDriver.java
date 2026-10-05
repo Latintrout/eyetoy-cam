@@ -313,10 +313,10 @@ final class EyeToyDriver {
             {0xff, 0x00},
     };
 
-    /** Configures VGA (640x480) at 15 fps and starts the image stream. */
-    void start() throws IOException {
+    /** Configures VGA (640x480) at 15 or 30 fps and starts the image stream. */
+    void start(int fps) throws IOException {
         final int width = 640, height = 480;
-        log.log("Configuring 640x480 @ 15 fps...");
+        log.log("Configuring 640x480 @ " + fps + " fps...");
 
         // ---- bridge (ov519_mode_init_regs) ----
         writeRegs(MODE_INIT_519);
@@ -333,10 +333,15 @@ final class EyeToyDriver {
         regW(0x26, 0x00);
 
         clockdiv = 0;
-        if (sensor == SEN_OV7640 || sensor == SEN_OV7648) {   // 15 fps
-            regW(0xa4, 0x04);
-            regW(0x23, 0xff);
-            clockdiv = 1;
+        if (sensor == SEN_OV7640 || sensor == SEN_OV7648) {
+            if (fps >= 30) {
+                regW(0xa4, 0x0c);
+                regW(0x23, 0xff);
+            } else {                                          // 15 fps
+                regW(0xa4, 0x04);
+                regW(0x23, 0xff);
+                clockdiv = 1;
+            }
         }
 
         // ---- sensor (set_ov_sensor_window + mode_init_ov_sensor_regs), VGA ----

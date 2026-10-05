@@ -1,5 +1,6 @@
 package com.latintrout.eyetoycam;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
@@ -10,6 +11,7 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
@@ -31,6 +33,7 @@ import android.util.Log;
 import android.view.Gravity;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -66,6 +69,11 @@ public class MainActivity extends Activity {
     private ScrollView logScroll;
     private ImageView preview;
 
+    private volatile Recorder recorder;
+    private volatile int fps = 15;
+    private UsbDevice currentDevice;
+    private Button recordBtn, fpsBtn;
+
     private volatile byte[] lastGoodJpeg;
     private volatile byte[] lastRawFrame;
     private volatile int framesShown, framesBad;
@@ -76,6 +84,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         usb = getSystemService(UsbManager.class);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         buildUi();
 
         IntentFilter f = new IntentFilter();
@@ -147,10 +156,14 @@ public class MainActivity extends Activity {
         row1.setGravity(Gravity.CENTER);
         row1.addView(button("Connect", v -> connect()), weight());
         row1.addView(button("Stop", v -> worker.execute(this::stopAll)), weight());
+        fpsBtn = button("15 fps", v -> toggleFps());
+        row1.addView(fpsBtn, weight());
         root.addView(row1);
         LinearLayout row2 = new LinearLayout(this);
         row2.setGravity(Gravity.CENTER);
-        row2.addView(button("Save photo", v -> worker.execute(this::savePhoto)), weight());
+        recordBtn = button("⏺ Record", v -> toggleRecord());
+        row2.addView(recordBtn, weight());
+        row2.addView(button("Photo", v -> worker.execute(this::savePhoto)), weight());
         row2.addView(button("Copy log", v -> copyLog()), weight());
         root.addView(row2);
 
@@ -324,7 +337,8 @@ public class MainActivity extends Activity {
                 return;
             }
 
-            driver.start();
+            currentDevice = d;
+            driver.start(fps);
 
             int r = IsoStream.nativeStart(conn.getFileDescriptor(), bestEp.getAddress(), psize);
             if (r != 0) {
@@ -374,6 +388,8 @@ public class MainActivity extends Activity {
                         log("First picture received! " + bmp.getWidth() + "x" + bmp.getHeight()
                                 + (used != f ? " (needed Huffman tables added)" : ""));
                     }
+                    Recorder rec = recorder;
+                    if (rec != null && rec.isRunning()) rec.drawFrame(bmp);
                     Bitmap show = bmp;
                     ui.post(() -> preview.setImageBitmap(show));
                 } else {
@@ -390,7 +406,13 @@ public class MainActivity extends Activity {
                 int fps = framesShown - lastShown;
                 lastShown = framesShown;
                 lastStatus = now;
-                status(String.format(Locale.US,
+                Recorder rec = recorder;
+                String recText = "";
+                if (rec != null && rec.isRunning()) {
+                    long sec = rec.elapsedMs() / 1000;
+                    recText = String.format(Locale.US, "● REC %d:%02d · ", sec / 60, sec % 60);
+                }
+                status(recText + String.format(Locale.US,
                         "Streaming · %d fps · shown %d · bad %d · frames %d · dropped %d · data packets %d · KB %d · pkt err %d",
                         fps, framesShown, framesBad, s[4], s[5], s[2], s[3] / 1024, s[6]));
                 if (!warnedNoData && now - started > 5000 && framesShown == 0) {
@@ -473,8 +495,79 @@ public class MainActivity extends Activity {
         }
     }
 
+    // ------------------------------------------------------------ recording
+
+    private void toggleRecord() {
+        Recorder rec = recorder;
+        if (rec != null && rec.isRunning()) {
+            worker.execute(this::stopRecording);
+            return;
+        }
+        if (!streaming) {
+            log("Connect the camera first, then tap Record.");
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            log("Asking for microphone permission (for sound)...");
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+            return;
+        }
+        worker.execute(() -> startRecording(true));
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode != 1) return;
+        boolean ok = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
+        if (!ok) log("No microphone permission, so recording without sound.");
+        if (streaming) worker.execute(() -> startRecording(ok));
+    }
+
+    /** Runs on the worker thread. */
+    private void startRecording(boolean withSound) {
+        if (!streaming || (recorder != null && recorder.isRunning())) return;
+        Recorder r = new Recorder(this::log);
+        try {
+            r.start(this, 640, 480, fps, withSound);
+            recorder = r;
+            ui.post(() -> recordBtn.setText("⏹ Stop rec"));
+        } catch (Exception e) {
+            log("Couldn't start recording: " + e.getMessage());
+            Log.e(TAG, "startRecording", e);
+            r.stop();
+        }
+    }
+
+    /** Runs on the worker thread. */
+    private void stopRecording() {
+        Recorder r = recorder;
+        recorder = null;
+        if (r != null) r.stop();
+        ui.post(() -> recordBtn.setText("⏺ Record"));
+    }
+
+    private void toggleFps() {
+        Recorder rec = recorder;
+        if (rec != null && rec.isRunning()) {
+            log("Stop recording before changing the frame rate.");
+            return;
+        }
+        fps = fps == 15 ? 30 : 15;
+        fpsBtn.setText(fps + " fps");
+        log("Frame rate set to " + fps + " fps.");
+        if (streaming && currentDevice != null) {
+            UsbDevice d = currentDevice;
+            worker.execute(() -> {
+                stopAll();
+                openAndStart(d);
+            });
+        }
+    }
+
     /** Safe to call any time, from the worker thread. */
     private void stopAll() {
+        stopRecording();
         boolean was = streaming;
         streaming = false;
         if (frameThread != null) {

@@ -2,7 +2,7 @@
 
 An Android app that uses an original PlayStation 2 EyeToy (USB ID `054c:0155`, OV519 chip) as a camera on an Android phone over USB OTG.
 
-**Status:** test build. It connects to the camera, starts it, shows the live picture and can save a photo. Video recording comes next.
+**Status:** test build. Live preview, photos, and video recording (MP4 with sound from the EyeToy mic) at 15 or 30 fps.
 
 ## Install
 

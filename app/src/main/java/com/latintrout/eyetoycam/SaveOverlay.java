@@ -37,13 +37,14 @@ final class SaveOverlay extends FrameLayout {
         box.setGravity(Gravity.CENTER_HORIZONTAL);
         int p = Ps2Ui.dp(c, 24);
         box.setPadding(p, p, p, p);
-        box.setBackground(Ps2Ui.panel(c, 0xF0081445, Ps2Ui.EDGE, 12));
+        box.setBackground(Ps2Ui.panel(c, Ps2Ui.DIALOG, Ps2Ui.EDGE, 12));
 
         icon = new IconView(c, IconView.SAVE);
         icon.setColor(Ps2Ui.CYAN);
         box.addView(icon, new LinearLayout.LayoutParams(Ps2Ui.dp(c, 56), Ps2Ui.dp(c, 56)));
 
-        title = Ps2Ui.glow(Ps2Ui.text(c, "Saving data...", 18, Ps2Ui.WHITE, true), 0x806FB5FF);
+        title = Ps2Ui.text(c, "Saving data...", 18, Ps2Ui.WHITE, true);
+        if (!Ps2Ui.theme.light) Ps2Ui.glow(title, 0x806FB5FF);
         title.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -139,7 +140,7 @@ final class SaveOverlay extends FrameLayout {
 
         Bar(Context c) {
             super(c);
-            track.setColor(0x33FFFFFF);
+            track.setColor(Ps2Ui.theme.light ? 0x33000000 : 0x33FFFFFF);
         }
 
         void setMode(int m) {

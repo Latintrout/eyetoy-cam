@@ -2,6 +2,7 @@ package com.latintrout.eyetoycam;
 
 import android.content.Context;
 import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.view.Gravity;
 import android.view.View;
@@ -9,18 +10,42 @@ import android.view.ViewGroup;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
-/** Colours and small building blocks for the PS2-menu look (our own artwork, not Sony's). */
+/**
+ * Colours and small building blocks for the app's looks (our own artwork, not Sony's).
+ * The colour fields follow the active Theme; call apply() before building the screen.
+ */
 final class Ps2Ui {
     private Ps2Ui() { }
 
-    static final int WHITE = 0xFFEAF2FF;
-    static final int DIM = 0xFF8FA3C8;
-    static final int CYAN = 0xFF7FD2FF;
-    static final int BLUE = 0xFF2F6BFF;
-    static final int SEL = 0xFF1F4FD0;
-    static final int PANEL = 0xB0071033;
-    static final int EDGE = 0x805FA8FF;
+    // names kept from the PS2 look: WHITE = main text, CYAN = accent
+    static int WHITE, DIM, CYAN, SEL, SEL_TEXT, PANEL, EDGE, IDLE, DIALOG, LOG_BG, LOG_TEXT, HUD_ACCENT;
     static final int RED = 0xFFE5232B;
+    /** Text drawn over the camera picture, the same in every look. */
+    static final int HUD = 0xFFF4F6FA;
+    static final int HUD_DIM = 0xFFC2CAD6;
+    static Theme theme;
+
+    static {
+        apply(Theme.byId(Theme.DEFAULT));
+    }
+
+    static void apply(Theme t) {
+        theme = t;
+        WHITE = t.text;
+        DIM = t.dim;
+        CYAN = t.accent;
+        SEL = t.sel;
+        SEL_TEXT = t.selText;
+        PANEL = t.panel;
+        EDGE = t.edge;
+        IDLE = t.idle;
+        DIALOG = t.dialog;
+        LOG_BG = t.logBg;
+        LOG_TEXT = t.logText;
+        HUD_ACCENT = t.hudAccent;
+    }
+
+    static boolean isPs2() { return Theme.PS2.equals(theme.id); }
 
     interface BoolCb { void on(boolean v); }
     interface IntCb { void on(int v); }
@@ -29,7 +54,13 @@ final class Ps2Ui {
         return Math.round(v * c.getResources().getDisplayMetrics().density);
     }
 
-    static GradientDrawable panel(Context c, int fill, int stroke, float radiusDp) {
+    static Drawable panel(Context c, int fill, int stroke, float radiusDp) {
+        if (theme.chamfer) {
+            float px = c.getResources().getDisplayMetrics().density;
+            boolean selected = fill == SEL;
+            return new ThemedPanel(fill, selected && theme.glow ? CYAN : stroke,
+                    Math.min(radiusDp, 10f) * 0.7f * px, px, theme.bevel, selected && theme.glow);
+        }
         GradientDrawable g = new GradientDrawable();
         g.setColor(fill);
         g.setCornerRadius(dp(c, radiusDp));
@@ -50,8 +81,30 @@ final class Ps2Ui {
         t.setText(s);
         t.setTextSize(sp);
         t.setTextColor(color);
-        t.setTypeface(Typeface.create(bold ? "sans-serif-medium" : "sans-serif-light", Typeface.NORMAL));
+        t.setTypeface(theme.face(bold));
         return t;
+    }
+
+    /** Monospace text for the camera-picture overlay, with a shadow so it reads on any picture. */
+    static TextView hud(Context c, CharSequence s, float sp, int color) {
+        TextView t = new TextView(c);
+        t.setText(s);
+        t.setTextSize(sp);
+        t.setTextColor(color);
+        t.setTypeface(Typeface.create(Typeface.MONOSPACE, Typeface.BOLD));
+        t.setLetterSpacing(0.04f);
+        t.setShadowLayer(dp(c, 3), 0, dp(c, 1), 0xCC000000);
+        return t;
+    }
+
+    /** Background for a button or tab that is not selected (none in the PS2 look). */
+    static Drawable idle(Context c, float radiusDp) {
+        return isPs2() ? null : panel(c, IDLE, EDGE, radiusDp);
+    }
+
+    /** Background for a selected button or tab. */
+    static Drawable selected(Context c, float radiusDp) {
+        return isPs2() ? panel(c, 0x552F6BFF, CYAN, radiusDp) : panel(c, SEL, CYAN, radiusDp);
     }
 
     static TextView glow(TextView t, int color) {
@@ -101,8 +154,8 @@ final class Ps2Ui {
         final boolean[] state = {init};
         final Runnable paint = () -> {
             pill.setText(state[0] ? "ON" : "OFF");
-            pill.setTextColor(state[0] ? WHITE : DIM);
-            pill.setBackground(panel(c, state[0] ? SEL : 0x40000000, state[0] ? CYAN : EDGE, 14));
+            pill.setTextColor(state[0] ? SEL_TEXT : DIM);
+            pill.setBackground(panel(c, state[0] ? SEL : IDLE, state[0] ? CYAN : EDGE, 14));
         };
         paint.run();
         row.setOnClickListener(v -> {
@@ -132,8 +185,8 @@ final class Ps2Ui {
         final Runnable paint = () -> {
             for (int i = 0; i < tvs.length; i++) {
                 boolean on = i == selected[0];
-                tvs[i].setTextColor(on ? WHITE : DIM);
-                tvs[i].setBackground(panel(c, on ? SEL : 0x40000000, on ? CYAN : EDGE, 8));
+                tvs[i].setTextColor(on ? SEL_TEXT : DIM);
+                tvs[i].setBackground(panel(c, on ? SEL : IDLE, on ? CYAN : EDGE, 8));
             }
         };
         for (int i = 0; i < opts.length; i++) {

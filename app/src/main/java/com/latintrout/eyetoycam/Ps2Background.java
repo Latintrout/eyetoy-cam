@@ -17,7 +17,7 @@ import java.util.Random;
  * Dark-blue backdrop with softly rising glowing columns and drifting specks,
  * in the spirit of the PS2 menu (original artwork, no Sony assets).
  */
-final class Ps2Background extends View {
+final class Ps2Background extends View implements Backdrop {
     private static final int TOWERS = 15;
     private static final int ORBS = 22;
 
@@ -68,7 +68,8 @@ final class Ps2Background extends View {
     }
 
     /** Pausing the animation saves battery/CPU, e.g. while recording. */
-    void setAnimated(boolean on) {
+    @Override
+    public void setAnimated(boolean on) {
         if (animated == on) return;
         animated = on;
         removeCallbacks(tick);

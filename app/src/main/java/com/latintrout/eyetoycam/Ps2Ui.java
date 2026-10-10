@@ -17,7 +17,7 @@ import android.widget.TextView;
 final class Ps2Ui {
     private Ps2Ui() { }
 
-    // names kept from the PS2 look: WHITE = main text, CYAN = accent
+    // names kept from the first look: WHITE = main text, CYAN = accent
     static int WHITE, DIM, CYAN, SEL, SEL_TEXT, PANEL, EDGE, IDLE, DIALOG, LOG_BG, LOG_TEXT, HUD_ACCENT;
     static final int RED = 0xFFE5232B;
     /** Text drawn over the camera picture, the same in every look. */
@@ -45,7 +45,6 @@ final class Ps2Ui {
         HUD_ACCENT = t.hudAccent;
     }
 
-    static boolean isPs2() { return Theme.PS2.equals(theme.id); }
 
     interface BoolCb { void on(boolean v); }
     interface IntCb { void on(int v); }
@@ -97,14 +96,14 @@ final class Ps2Ui {
         return t;
     }
 
-    /** Background for a button or tab that is not selected (none in the PS2 look). */
+    /** Background for a button or tab that is not selected. */
     static Drawable idle(Context c, float radiusDp) {
-        return isPs2() ? null : panel(c, IDLE, EDGE, radiusDp);
+        return panel(c, IDLE, EDGE, radiusDp);
     }
 
     /** Background for a selected button or tab. */
     static Drawable selected(Context c, float radiusDp) {
-        return isPs2() ? panel(c, 0x552F6BFF, CYAN, radiusDp) : panel(c, SEL, CYAN, radiusDp);
+        return panel(c, SEL, CYAN, radiusDp);
     }
 
     static TextView glow(TextView t, int color) {

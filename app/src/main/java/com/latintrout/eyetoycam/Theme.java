@@ -7,9 +7,9 @@ import android.graphics.Typeface;
  * Ps2Ui copies the active one into its colour fields before the screen is built.
  */
 final class Theme {
-    static final String RETRO = "retro", NEON = "neon", PS2 = "ps2";
-    static final String[] IDS = {RETRO, NEON, PS2};
-    static final String[] NAMES = {"Retro grey", "Neon blue", "PS2 menu"};
+    static final String RETRO = "retro", NEON = "neon";
+    static final String[] IDS = {RETRO, NEON};
+    static final String[] NAMES = {"Retro grey", "Neon blue"};
     static final String DEFAULT = NEON;
 
     final String id;
@@ -74,17 +74,8 @@ final class Theme {
             0xFF020611, 0xFF071A45,
             true, false, true, false, "sans-serif-condensed", "sans-serif-condensed-medium");
 
-    /** The build 3 look. */
-    static final Theme PS2_MENU = new Theme(PS2,
-            0xFFEAF2FF, 0xFF8FA3C8, 0xFF7FD2FF, 0xFF1F4FD0, 0xFFEAF2FF,
-            0xB0071033, 0x805FA8FF, 0x40000000, 0xF0081445,
-            0xB0030A22, 0xFFD5E2F5, 0xFF7FD2FF,
-            0xFF01030C, 0xFF0A1F5E,
-            false, false, false, false, "sans-serif-light", "sans-serif-medium");
-
     static Theme byId(String id) {
         if (RETRO.equals(id)) return RETRO_GREY;
-        if (PS2.equals(id)) return PS2_MENU;
         return NEON_BLUE;
     }
 

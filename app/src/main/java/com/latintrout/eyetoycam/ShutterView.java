@@ -50,20 +50,6 @@ final class ShutterView extends View {
     @Override
     protected void onDraw(Canvas c) {
         float cx = getWidth() / 2f, cy = getHeight() / 2f;
-        if (Ps2Ui.isPs2()) {
-            float r = Math.min(cx, cy) - ring.getStrokeWidth();
-            ring.setShadowLayer(Ps2Ui.dp(getContext(), 6), 0, 0, 0x806FB5FF);
-            c.drawCircle(cx, cy, r, ring);
-            inner.setColor(photo ? Ps2Ui.WHITE : Ps2Ui.RED);
-            if (recording) {
-                float h = r * 0.52f;
-                c.drawRoundRect(new RectF(cx - h, cy - h, cx + h, cy + h), h * 0.3f, h * 0.3f, inner);
-            } else {
-                c.drawCircle(cx, cy, r * 0.76f, inner);
-            }
-            return;
-        }
-
         float d = Ps2Ui.dp(getContext(), 1);
         float outer = Math.min(cx, cy) - 4 * d;
         float r = Math.min(cx, cy) * 0.78f;

@@ -203,10 +203,7 @@ public class MainActivity extends Activity {
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(Ps2Ui.theme.bgBottom);
-        View bg;
-        if (Ps2Ui.isPs2()) bg = new Ps2Background(this);
-        else if (Ps2Ui.theme.light) bg = new RetroBackground(this);
-        else bg = new NeonBackground(this);
+        View bg = Ps2Ui.theme.light ? new RetroBackground(this) : new NeonBackground(this);
         background = (Backdrop) bg;
         root.addView(bg, new FrameLayout.LayoutParams(MATCH, MATCH));
 
@@ -241,7 +238,7 @@ public class MainActivity extends Activity {
             IconView icon = new IconView(this, icons[i]);
             box.addView(icon, new LinearLayout.LayoutParams(dp(18), dp(18)));
             TextView t = Ps2Ui.text(this, names[i], 13, Ps2Ui.DIM, true);
-            t.setLetterSpacing(Ps2Ui.isPs2() ? 0.16f : 0.08f);
+            t.setLetterSpacing(0.08f);
             t.setSingleLine(true);
             LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(WRAP, WRAP);
             tl.leftMargin = dp(7);
@@ -250,10 +247,8 @@ public class MainActivity extends Activity {
             tabIcons[i] = icon;
             tabBoxes[i] = box;
             LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(0, WRAP, 1f);
-            if (!Ps2Ui.isPs2()) {
-                bl.leftMargin = dp(2);
-                bl.rightMargin = dp(2);
-            }
+            bl.leftMargin = dp(2);
+            bl.rightMargin = dp(2);
             tabBar.addView(box, bl);
         }
         content.addView(tabBar, new LinearLayout.LayoutParams(MATCH, WRAP));
@@ -304,16 +299,11 @@ public class MainActivity extends Activity {
 
         // ---- picture frame ----
         previewFrame = new AspectLayout(this);
-        if (Ps2Ui.isPs2()) {
-            previewFrame.setBackground(Ps2Ui.panel(this, 0xFF000000, Ps2Ui.EDGE, 10));
-            previewFrame.setClipToOutline(true);
-        } else {
-            // a visible frame around the picture
-            previewFrame.setBackground(Ps2Ui.panel(this, Ps2Ui.theme.light ? 0xFFB3B5BA : 0xCC040B22,
-                    Ps2Ui.theme.light ? 0xFF6F7278 : Ps2Ui.CYAN, 10));
-            int fp = dp(Ps2Ui.theme.glow ? 6 : 5);
-            previewFrame.setPadding(fp, fp, fp, fp);
-        }
+        // a visible frame around the picture
+        previewFrame.setBackground(Ps2Ui.panel(this, Ps2Ui.theme.light ? 0xFFB3B5BA : 0xCC040B22,
+                Ps2Ui.theme.light ? 0xFF6F7278 : Ps2Ui.CYAN, 10));
+        int fp = dp(Ps2Ui.theme.glow ? 6 : 5);
+        previewFrame.setPadding(fp, fp, fp, fp);
         FrameLayout screen = new FrameLayout(this);
         screen.setBackgroundColor(0xFF000000);
         previewFrame.addView(screen, new FrameLayout.LayoutParams(MATCH, MATCH));
@@ -411,25 +401,22 @@ public class MainActivity extends Activity {
         LinearLayout modeRow = new LinearLayout(this);
         modeRow.setOrientation(LinearLayout.HORIZONTAL);
         modeRow.setGravity(Gravity.CENTER);
-        if (!Ps2Ui.isPs2()) {
-            modeRow.setBackground(Ps2Ui.panel(this, Ps2Ui.PANEL, Ps2Ui.EDGE, 8));
-            modeRow.setPadding(dp(3), dp(3), dp(3), dp(3));
-        }
+        modeRow.setBackground(Ps2Ui.panel(this, Ps2Ui.PANEL, Ps2Ui.EDGE, 8));
+        modeRow.setPadding(dp(3), dp(3), dp(3), dp(3));
         String[] mn = {"VIDEO", "PHOTO", "TIME-LAPSE"};
         final String[] ids = {Prefs.MODE_VIDEO, Prefs.MODE_PHOTO, Prefs.MODE_TIMELAPSE};
         for (int i = 0; i < 3; i++) {
             final int idx = i;
             TextView t = Ps2Ui.text(this, mn[i], 13, Ps2Ui.DIM, true);
-            t.setLetterSpacing(Ps2Ui.isPs2() ? 0.14f : 0.06f);
+            t.setLetterSpacing(0.06f);
             t.setGravity(Gravity.CENTER);
             t.setSingleLine(true);
             t.setPadding(dp(8), dp(10), dp(8), dp(10));
             t.setOnClickListener(v -> setMode(ids[idx]));
             modeTabs[i] = t;
-            LinearLayout.LayoutParams lp = Ps2Ui.isPs2()
-                    ? new LinearLayout.LayoutParams(WRAP, WRAP) : new LinearLayout.LayoutParams(0, WRAP, 1f);
-            lp.leftMargin = dp(Ps2Ui.isPs2() ? 4 : 1);
-            lp.rightMargin = dp(Ps2Ui.isPs2() ? 4 : 1);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, WRAP, 1f);
+            lp.leftMargin = dp(1);
+            lp.rightMargin = dp(1);
             modeRow.addView(t, lp);
         }
         page.addView(modeRow, new LinearLayout.LayoutParams(MATCH, WRAP));
@@ -492,9 +479,6 @@ public class MainActivity extends Activity {
     }
 
     private android.graphics.drawable.Drawable buttonBg(boolean on) {
-        if (Ps2Ui.isPs2()) {
-            return Ps2Ui.panel(this, on ? Ps2Ui.SEL : 0x66071033, on ? Ps2Ui.CYAN : Ps2Ui.EDGE, 14);
-        }
         return on ? Ps2Ui.selected(this, 8) : Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 8);
     }
 
@@ -542,6 +526,15 @@ public class MainActivity extends Activity {
 
         // ---- look ----
         LinearLayout lookBox = Ps2Ui.section(this, settingsList, "Look");
+        lookBox.addView(Ps2Ui.toggleRow(this, "Details on screen",
+                "Mode, size, frame rate, date, time and free space over the picture. Turn off for a clearer frame.",
+                prefs.b("hud_screen", true), on -> {
+                    prefs.putB("hud_screen", on);
+                    setHudVisible(streaming);
+                }));
+        lookBox.addView(Ps2Ui.toggleRow(this, "Details on video",
+                "Burns size, frame rate, camera name, date and time into the video itself. Applies to the next recording.",
+                prefs.b("hud_video", false), on -> prefs.putB("hud_video", on)));
         lookBox.addView(Ps2Ui.segmentRow(this, "Style", "Changes colours and buttons only. Everything works the same.",
                 Theme.NAMES, Theme.index(prefs.s("theme", Theme.DEFAULT)), i -> {
                     if (Theme.IDS[i].equals(prefs.s("theme", Theme.DEFAULT))) return;
@@ -775,7 +768,7 @@ public class MainActivity extends Activity {
         for (int i = 0; i < 3; i++) {
             pages[i].setVisibility(i == p ? View.VISIBLE : View.GONE);
             boolean on = i == p;
-            int col = on ? (Ps2Ui.isPs2() ? Ps2Ui.WHITE : Ps2Ui.SEL_TEXT) : Ps2Ui.DIM;
+            int col = on ? Ps2Ui.SEL_TEXT : Ps2Ui.DIM;
             tabs[i].setTextColor(col);
             tabIcons[i].setColor(col);
             tabBoxes[i].setBackground(on ? Ps2Ui.selected(this, 18) : Ps2Ui.idle(this, 8));
@@ -836,7 +829,7 @@ public class MainActivity extends Activity {
         String[] ids = {Prefs.MODE_VIDEO, Prefs.MODE_PHOTO, Prefs.MODE_TIMELAPSE};
         for (int i = 0; i < 3; i++) {
             boolean on = ids[i].equals(mode);
-            modeTabs[i].setTextColor(on ? (Ps2Ui.isPs2() ? Ps2Ui.WHITE : Ps2Ui.SEL_TEXT) : Ps2Ui.DIM);
+            modeTabs[i].setTextColor(on ? Ps2Ui.SEL_TEXT : Ps2Ui.DIM);
             modeTabs[i].setBackground(on ? Ps2Ui.selected(this, 18) : null);
         }
         updateHudMode();
@@ -886,6 +879,7 @@ public class MainActivity extends Activity {
     }
 
     private void setHudVisible(boolean on) {
+        on = on && prefs.b("hud_screen", true);
         int v = on ? View.VISIBLE : View.GONE;
         hudMode.setVisibility(v);
         hudClock.setVisibility(v);
@@ -1416,7 +1410,8 @@ public class MainActivity extends Activity {
         String desc = Metadata.description(label, sensorName, 640, 480, fps, tl);
         Recorder r = new Recorder(this::log);
         try {
-            r.start(this, 640, 480, fps, withSound, look, base, desc, tl, TL_OUT_FPS);
+            r.start(this, 640, 480, fps, withSound, look, base, desc, tl, TL_OUT_FPS,
+                    prefs.b("hud_video", false), label);
             lastTlMs = 0;
             recorder = r;
             startLedBlink();

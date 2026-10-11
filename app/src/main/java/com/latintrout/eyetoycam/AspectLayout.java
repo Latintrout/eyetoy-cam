@@ -13,6 +13,15 @@ final class AspectLayout extends FrameLayout {
 
     AspectLayout(Context c) { super(c); }
 
+    private boolean fill;
+
+    /** When on, the frame just takes the size its parent gives it (used for several cameras). */
+    void setFill(boolean on) {
+        if (on == fill) return;
+        fill = on;
+        requestLayout();
+    }
+
     void setRatio(float r) {
         if (r == ratio) return;
         ratio = r;
@@ -21,6 +30,10 @@ final class AspectLayout extends FrameLayout {
 
     @Override
     protected void onMeasure(int wSpec, int hSpec) {
+        if (fill) {
+            super.onMeasure(wSpec, hSpec);
+            return;
+        }
         int w = View.MeasureSpec.getSize(wSpec);
         int hMode = View.MeasureSpec.getMode(hSpec);
         int hMax = View.MeasureSpec.getSize(hSpec);

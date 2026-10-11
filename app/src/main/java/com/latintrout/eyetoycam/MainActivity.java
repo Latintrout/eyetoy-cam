@@ -97,7 +97,6 @@ public class MainActivity extends Activity {
     private final WaveDetector wave = new WaveDetector();
     private final int[] zoneBuf = new int[WaveDetector.GX * WaveDetector.GY];
     private float lastRingCharge;
-    private volatile byte[] lastGoodJpeg;
     private volatile int framesShown, framesBad;
     private volatile long lastTlMs;
     private volatile boolean countingDown;
@@ -117,6 +116,12 @@ public class MainActivity extends Activity {
     private AspectLayout previewFrame;
     private CamGrid grid;
     private FrameLayout screen;
+    private View spacerTop, spacerMid;
+    // dragging / resizing a free camera window
+    private int dragCam = -1;
+    private boolean dragResize, dragMoved;
+    private float dragX, dragY;
+    private ScaleGestureDetector winPinch;
     private LinearLayout noCamera;
     private LinearLayout recBox;
     private View recDot;
@@ -320,7 +325,8 @@ public class MainActivity extends Activity {
     private View buildCameraPage() {
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
-        page.addView(spacer(0.5f));
+        spacerTop = spacer(0.5f);
+        page.addView(spacerTop);
 
         // ---- picture frame ----
         previewFrame = new AspectLayout(this);
@@ -362,18 +368,39 @@ public class MainActivity extends Activity {
                 return true;
             }
         });
-        // with several cameras, tapping a picture makes it the main camera
+        // with several cameras: tap a picture to make it the main camera, double-tap to show it alone
         final android.view.GestureDetector taps = new android.view.GestureDetector(this,
                 new android.view.GestureDetector.SimpleOnGestureListener() {
                     @Override
-                    public boolean onSingleTapUp(android.view.MotionEvent e) {
-                        onTileTapped(grid.tileAt(e.getX(), e.getY()));
+                    public boolean onSingleTapConfirmed(android.view.MotionEvent e) {
+                        onTileTapped(grid.camAt(e.getX(), e.getY()));
+                        return true;
+                    }
+
+                    @Override
+                    public boolean onDoubleTap(android.view.MotionEvent e) {
+                        onTileDoubleTapped(grid.camAt(e.getX(), e.getY()));
                         return true;
                     }
                 });
+        // in Free layout, pinching a window resizes it
+        winPinch = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override
+            public boolean onScale(ScaleGestureDetector d) {
+                View t = dragCam < 0 ? null : findTile(dragCam);
+                if (t != null) grid.resizeWindow(dragCam, t.getWidth() * d.getScaleFactor(), true);
+                dragMoved = true;
+                return true;
+            }
+        });
         screen.setOnTouchListener((v, e) -> {
-            pinch.onTouchEvent(e);
-            if (!pinch.isInProgress()) taps.onTouchEvent(e);
+            if (grid.isFree() && grid.solo() < 0) {
+                onWindowTouch(e);
+            } else {
+                pinch.onTouchEvent(e);
+            }
+            // a drag or pinch never counts as a tap (the detector cancels taps on movement and second fingers)
+            taps.onTouchEvent(e);
             return true;
         });
 
@@ -443,7 +470,8 @@ public class MainActivity extends Activity {
 
         page.addView(previewFrame, new LinearLayout.LayoutParams(MATCH, WRAP));
         page.addView(buildToolsRow());
-        page.addView(spacer(1f));
+        spacerMid = spacer(1f);
+        page.addView(spacerMid);
 
         // ---- mode selector ----
         LinearLayout modeRow = new LinearLayout(this);
@@ -723,8 +751,8 @@ public class MainActivity extends Activity {
         // ---- several cameras ----
         LinearLayout multi = Ps2Ui.section(this, settingsList, "Cameras");
         multi.addView(Ps2Ui.segmentRow(this, "Layout with more than one camera",
-                "Auto stacks two cameras and uses a 2\u00D72 grid for three or four. Tap a picture to make it the main camera, the one that records and takes photos.",
-                new String[]{"Auto", "Stacked", "Grid"}, prefs.i("multi_layout", CamGrid.AUTO), i -> {
+                "Auto stacks two cameras and uses a 2\u00D72 grid for three or four. Free lets you drag each picture anywhere and resize it from its corner or by pinching. Tap a picture to make it the main camera (it records); double-tap to see it alone.",
+                new String[]{"Auto", "Stacked", "Grid", "Free"}, prefs.i("multi_layout", CamGrid.AUTO), i -> {
                     prefs.putI("multi_layout", i);
                     layoutTiles();
                 }));
@@ -985,13 +1013,17 @@ public class MainActivity extends Activity {
         grid.removeAllViews();
         if (waveRing.getParent() != null) ((ViewGroup) waveRing.getParent()).removeView(waveRing);
         boolean multi = list.size() > 1;
+        int layout = prefs.i("multi_layout", CamGrid.AUTO);
+        boolean free = multi && layout == CamGrid.FREE;
         Cam m = main;
+        boolean soloLeft = false;
         for (Cam c : list) {
             FrameLayout tile = new FrameLayout(this);
+            tile.setTag(c.number());
             boolean isMain = c == m;
             int pad = multi ? dp(2) : 0;
             tile.setPadding(pad, pad, pad, pad);
-            tile.setBackgroundColor(multi && isMain ? Ps2Ui.CYAN : 0xFF000000);
+            tile.setBackgroundColor(multi && isMain ? Ps2Ui.CYAN : multi ? 0xFF33363C : 0xFF000000);
             FrameLayout inner = new FrameLayout(this);
             inner.setBackgroundColor(0xFF000000);
             inner.setClipChildren(true);
@@ -1008,28 +1040,116 @@ public class MainActivity extends Activity {
             FrameLayout.LayoutParams ll = new FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
             ll.bottomMargin = dp(4);
             inner.addView(lb, ll);
+            if (free) {
+                // corner grip: drag it to resize the window
+                TextView grip = Ps2Ui.text(this, "\u25E2", 16, Ps2Ui.WHITE, true);
+                grip.setAlpha(0.8f);
+                FrameLayout.LayoutParams gl = new FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM | Gravity.END);
+                gl.rightMargin = dp(2);
+                inner.addView(grip, gl);
+            }
             if (isMain) inner.addView(waveRing, new FrameLayout.LayoutParams(MATCH, MATCH));
             c.tile = tile;
             c.view = v;
             c.label = lb;
+            if (free && grid.window(c.number()) == null) {
+                float[] w = loadWindow(c.number());
+                if (w != null) grid.setWindow(c.number(), w);
+            }
+            if (c.number() == grid.solo()) soloLeft = true;
             grid.addView(tile);
         }
         if (waveRing.getParent() == null) screen.addView(waveRing, screen.indexOfChild(grid) + 1,
                 new FrameLayout.LayoutParams(MATCH, MATCH));
-        grid.setShape(list.size(), prefs.i("multi_layout", CamGrid.AUTO));
+        if (!soloLeft || !multi) grid.setSolo(-1);
+        grid.setShape(list.size(), layout);
         previewFrame.setRatio(grid.ratio());
+
+        // with several cameras the pictures get all the room between the picture tools and the buttons
+        previewFrame.setFill(multi);
+        previewFrame.setLayoutParams(new LinearLayout.LayoutParams(MATCH, multi ? 0 : WRAP, multi ? 1f : 0f));
+        spacerTop.setLayoutParams(new LinearLayout.LayoutParams(MATCH, 0, multi ? 0f : 0.5f));
+        spacerMid.setLayoutParams(new LinearLayout.LayoutParams(MATCH, multi ? dp(8) : 0, multi ? 0f : 1f));
+    }
+
+    private View findTile(int camNumber) {
+        for (int i = 0; i < grid.getChildCount(); i++) {
+            View v = grid.getChildAt(i);
+            if ((Integer) v.getTag() == camNumber) return v;
+        }
+        return null;
+    }
+
+    /** Free layout: drag a window to move it, drag its corner (or pinch it) to resize it. */
+    private void onWindowTouch(android.view.MotionEvent e) {
+        winPinch.onTouchEvent(e);
+        float x = e.getX(), y = e.getY();
+        switch (e.getActionMasked()) {
+            case android.view.MotionEvent.ACTION_DOWN: {
+                View t = grid.viewAt(x, y);
+                dragCam = t == null ? -1 : (Integer) t.getTag();
+                dragMoved = false;
+                dragX = x;
+                dragY = y;
+                if (t != null) {
+                    dragResize = x > t.getRight() - dp(40) && y > t.getBottom() - dp(40);
+                    grid.bringChildToFront(t);
+                }
+                break;
+            }
+            case android.view.MotionEvent.ACTION_MOVE: {
+                if (dragCam < 0 || e.getPointerCount() > 1 || winPinch.isInProgress()) break;
+                float dx = x - dragX, dy = y - dragY;
+                if (!dragMoved && Math.hypot(dx, dy) < dp(8)) break;
+                dragMoved = true;
+                View t = findTile(dragCam);
+                if (t == null) break;
+                if (dragResize) grid.resizeWindow(dragCam, t.getWidth() + dx, false);
+                else grid.moveWindow(dragCam, dx, dy);
+                dragX = x;
+                dragY = y;
+                break;
+            }
+            case android.view.MotionEvent.ACTION_UP:
+            case android.view.MotionEvent.ACTION_CANCEL:
+                if (dragCam >= 0 && dragMoved) saveWindow(dragCam);
+                dragCam = -1;
+                dragMoved = false;
+                break;
+            default:
+                break;
+        }
+    }
+
+    private void saveWindow(int camNumber) {
+        float[] p = grid.window(camNumber);
+        if (p != null) prefs.putS("win_" + camNumber, String.format(Locale.US, "%.4f,%.4f,%.4f", p[0], p[1], p[2]));
+    }
+
+    private float[] loadWindow(int camNumber) {
+        String[] f = prefs.s("win_" + camNumber, "").split(",");
+        if (f.length != 3) return null;
+        try {
+            return new float[]{Float.parseFloat(f[0]), Float.parseFloat(f[1]), Float.parseFloat(f[2])};
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private String tileText(Cam c, boolean isMain) {
         return "CAM " + c.number() + (isMain ? " \u25CF MAIN" : "") + (c.live ? " \u00B7 " + c.liveFps + " FPS" : "");
     }
 
+    private Cam camByNumber(int number) {
+        for (Cam c : camList()) if (c.number() == number) return c;
+        return null;
+    }
+
     /** Tapping a picture makes that camera the main one (the one that records and takes photos). */
-    private void onTileTapped(int index) {
-        java.util.List<Cam> list = camList();
-        if (list.size() < 2 || index < 0 || index >= list.size()) return;
-        Cam c = list.get(index);
-        if (c == main) return;
+    private void onTileTapped(int camNumber) {
+        if (camList().size() < 2) return;
+        Cam c = camByNumber(camNumber);
+        if (c == null || c == main) return;
         if (isRecording() || countingDown || saveOverlay.isShowing()) {
             Toast.makeText(this, "Stop recording first, then pick another camera.", Toast.LENGTH_SHORT).show();
             return;
@@ -1040,10 +1160,16 @@ public class MainActivity extends Activity {
         if (currentPage == PAGE_SETTINGS) fillSettings();
     }
 
+    /** Double-tapping a picture shows that camera alone, as big as it fits; double-tap again to see them all. */
+    private void onTileDoubleTapped(int camNumber) {
+        if (camList().size() < 2) return;
+        if (grid.solo() >= 0) grid.setSolo(-1);
+        else if (camNumber >= 0) grid.setSolo(camNumber);
+    }
+
     /** Makes c the camera that records, takes photos and watches for waves (null when none is left). */
     private void setMain(Cam c) {
         main = c;
-        lastGoodJpeg = null;
         framesShown = 0;
         framesBad = 0;
         wave.reset();
@@ -1397,6 +1523,7 @@ public class MainActivity extends Activity {
                 }
                 if (bmp != null) {
                     c.framesShown++;
+                    c.lastJpeg = used;
                     if (!c.live) {
                         c.live = true;
                         log((camList().size() > 1 ? tag : "") + "First picture received! " + bmp.getWidth() + "x" + bmp.getHeight()
@@ -1408,7 +1535,6 @@ public class MainActivity extends Activity {
                     }
                     if (isMain) {
                         framesShown++;
-                        lastGoodJpeg = used;
                         Recorder rec = recorder;
                         if (rec != null && rec.isRunning()) {
                             if (rec.isTimelapse()) {
@@ -1619,52 +1745,79 @@ public class MainActivity extends Activity {
         return new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
     }
 
+    /** Takes a photo from every running camera at the same moment (just the main one when it's alone). */
     private void takePhoto() {
-        final byte[] jpg = lastGoodJpeg;
-        if (jpg == null) {
+        // grab every camera's newest picture first, so they're all from the same instant
+        java.util.List<Cam> list = camList();
+        java.util.List<Cam> shot = new java.util.ArrayList<>();
+        java.util.List<byte[]> jpgs = new java.util.ArrayList<>();
+        Cam m = main;
+        byte[] mj = m == null ? null : m.lastJpeg;
+        if (mj != null) { shot.add(m); jpgs.add(mj); }
+        for (Cam c : list) {
+            byte[] j = c.lastJpeg;
+            if (c != m && j != null) { shot.add(c); jpgs.add(j); }
+        }
+        if (shot.isEmpty()) {
             log("No picture yet.");
             return;
         }
+        boolean multi = list.size() > 1;
+        String when = stamp();
         ui.post(() -> {
             flash();
-            saveOverlay.showSaving("Saving data...", "Do not unplug the EyeToy.");
+            saveOverlay.showSaving(shot.size() > 1 ? "Saving " + shot.size() + " photos..." : "Saving data...",
+                    "Do not unplug the EyeToy.");
         });
-        try {
-            String label = currentLabel();
-            String base = Metadata.baseName(label, stamp());
-            Bitmap src = BitmapFactory.decodeByteArray(jpg, 0, jpg.length);
-            if (src == null) throw new Exception("couldn't read the picture");
-            Bitmap out = look.apply(src);
-
-            ContentResolver cr = getContentResolver();
-            ContentValues v = new ContentValues();
-            v.put(MediaStore.Images.Media.DISPLAY_NAME, base + ".jpg");
-            v.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
-            v.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/EyeToyCam");
-            v.put(MediaStore.Images.Media.IS_PENDING, 1);
-            Uri u = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
-            if (u == null) throw new Exception("couldn't create the file");
-            try (OutputStream os = cr.openOutputStream(u)) {
-                if (os == null) throw new Exception("couldn't open the file");
-                out.compress(Bitmap.CompressFormat.JPEG, 95, os);
-            }
-            try (ParcelFileDescriptor pfd = cr.openFileDescriptor(u, "rw")) {
-                Metadata.writePhotoExif(pfd.getFileDescriptor(), label, sensorName, out.getWidth(), out.getHeight(),
-                        "EyeToy Cam");
+        int saved = 0;
+        String fail = null;
+        for (int i = 0; i < shot.size(); i++) {
+            Cam c = shot.get(i);
+            try {
+                savePhoto(jpgs.get(i), prefs.s("label_" + c.key(), "EyeToy"), c.sensorName,
+                        Metadata.baseName(prefs.s("label_" + c.key(), "EyeToy"), when) + (multi ? "_cam" + c.number() : ""),
+                        c == m);
+                saved++;
             } catch (Exception e) {
-                log("Photo saved, but the camera info couldn't be added: " + e.getMessage());
+                log((multi ? "Cam " + c.number() + ": " : "") + "Saving failed: " + e.getMessage());
+                fail = String.valueOf(e.getMessage());
             }
-            ContentValues done = new ContentValues();
-            done.put(MediaStore.Images.Media.IS_PENDING, 0);
-            cr.update(u, done, null, null);
-            log("Saved photo to Pictures/EyeToyCam/" + base + ".jpg");
-            setLast(u, false);
-            ui.post(() -> saveOverlay.showDone("Pictures / EyeToyCam"));
-        } catch (Exception e) {
-            log("Saving failed: " + e.getMessage());
-            final String m = String.valueOf(e.getMessage());
-            ui.post(() -> saveOverlay.showFail(m));
         }
+        if (saved > 0) ui.post(() -> saveOverlay.showDone("Pictures / EyeToyCam"));
+        else {
+            final String f = fail;
+            ui.post(() -> saveOverlay.showFail(f));
+        }
+    }
+
+    private void savePhoto(byte[] jpg, String label, String sensor, String base, boolean isMain) throws Exception {
+        Bitmap src = BitmapFactory.decodeByteArray(jpg, 0, jpg.length);
+        if (src == null) throw new Exception("couldn't read the picture");
+        Bitmap out = look.apply(src);
+
+        ContentResolver cr = getContentResolver();
+        ContentValues v = new ContentValues();
+        v.put(MediaStore.Images.Media.DISPLAY_NAME, base + ".jpg");
+        v.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+        v.put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/EyeToyCam");
+        v.put(MediaStore.Images.Media.IS_PENDING, 1);
+        Uri u = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
+        if (u == null) throw new Exception("couldn't create the file");
+        try (OutputStream os = cr.openOutputStream(u)) {
+            if (os == null) throw new Exception("couldn't open the file");
+            out.compress(Bitmap.CompressFormat.JPEG, 95, os);
+        }
+        try (ParcelFileDescriptor pfd = cr.openFileDescriptor(u, "rw")) {
+            Metadata.writePhotoExif(pfd.getFileDescriptor(), label, sensor, out.getWidth(), out.getHeight(),
+                    "EyeToy Cam");
+        } catch (Exception e) {
+            log("Photo saved, but the camera info couldn't be added: " + e.getMessage());
+        }
+        ContentValues done = new ContentValues();
+        done.put(MediaStore.Images.Media.IS_PENDING, 0);
+        cr.update(u, done, null, null);
+        log("Saved photo to Pictures/EyeToyCam/" + base + ".jpg");
+        if (isMain) setLast(u, false);
     }
 
     // ------------------------------------------------------------------ recording

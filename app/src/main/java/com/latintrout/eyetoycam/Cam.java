@@ -36,6 +36,8 @@ final class Cam {
     Thread thread;
     volatile int framesShown, framesBad, liveFps;
     volatile boolean live;
+    /** Newest picture that decoded, for photos. */
+    volatile byte[] lastJpeg;
 
     // on-screen tile (UI thread only)
     FrameLayout tile;

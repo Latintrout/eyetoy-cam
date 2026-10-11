@@ -16,11 +16,7 @@ import android.content.res.ColorStateList;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
-import android.hardware.usb.UsbConstants;
 import android.hardware.usb.UsbDevice;
-import android.hardware.usb.UsbDeviceConnection;
-import android.hardware.usb.UsbEndpoint;
-import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
 import android.net.Uri;
 import android.os.Build;
@@ -76,13 +72,15 @@ public class MainActivity extends Activity {
 
     // ---- camera state ----
     private UsbManager usb;
-    private UsbDeviceConnection conn;
-    private UsbInterface intfAlt0;
-    private EyeToyDriver driver;
-    private UsbDevice currentDevice;
+    /** Running cameras by stream slot (guarded by itself). The main one records, takes photos and sees waves. */
+    private final Cam[] cams = new Cam[IsoStream.MAX_SLOTS];
+    private volatile Cam main;
+    /** USB device names being opened or waiting for permission, so a camera is never opened twice. */
+    private final java.util.Set<String> pending = java.util.Collections.synchronizedSet(new java.util.HashSet<>());
+    private final java.util.ArrayDeque<UsbDevice> permQueue = new java.util.ArrayDeque<>();
+    private boolean permAsking;
     private volatile boolean streaming;
     private volatile int startedFps;
-    private Thread frameThread;
     private volatile String sensorName = "";
     private volatile String cameraKey = "default";
     private volatile String cameraSerial = "";
@@ -117,7 +115,8 @@ public class MainActivity extends Activity {
     private final LinearLayout[] tabBoxes = new LinearLayout[3];
     private int currentPage = -1;
     private AspectLayout previewFrame;
-    private ImageView preview;
+    private CamGrid grid;
+    private FrameLayout screen;
     private LinearLayout noCamera;
     private LinearLayout recBox;
     private View recDot;
@@ -175,6 +174,7 @@ public class MainActivity extends Activity {
 
         IntentFilter f = new IntentFilter();
         f.addAction(ACTION_PERMISSION);
+        f.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
         f.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(usbReceiver, f, Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(usbReceiver, f);
@@ -329,13 +329,13 @@ public class MainActivity extends Activity {
                 Ps2Ui.theme.light ? 0xFF6F7278 : Ps2Ui.CYAN, 10));
         int fp = dp(Ps2Ui.theme.glow ? 6 : 5);
         previewFrame.setPadding(fp, fp, fp, fp);
-        FrameLayout screen = new FrameLayout(this);
+        screen = new FrameLayout(this);
         screen.setBackgroundColor(0xFF000000);
         previewFrame.addView(screen, new FrameLayout.LayoutParams(MATCH, MATCH));
 
-        preview = new ImageView(this);
-        preview.setScaleType(ImageView.ScaleType.FIT_XY);
-        screen.addView(preview, new FrameLayout.LayoutParams(MATCH, MATCH));
+        // one picture per camera; tiles are added by layoutTiles()
+        grid = new CamGrid(this, dp(3));
+        screen.addView(grid, new FrameLayout.LayoutParams(MATCH, MATCH));
 
         noCamera = new LinearLayout(this);
         noCamera.setOrientation(LinearLayout.VERTICAL);
@@ -362,8 +362,18 @@ public class MainActivity extends Activity {
                 return true;
             }
         });
+        // with several cameras, tapping a picture makes it the main camera
+        final android.view.GestureDetector taps = new android.view.GestureDetector(this,
+                new android.view.GestureDetector.SimpleOnGestureListener() {
+                    @Override
+                    public boolean onSingleTapUp(android.view.MotionEvent e) {
+                        onTileTapped(grid.tileAt(e.getX(), e.getY()));
+                        return true;
+                    }
+                });
         screen.setOnTouchListener((v, e) -> {
             pinch.onTouchEvent(e);
+            if (!pinch.isInProgress()) taps.onTouchEvent(e);
             return true;
         });
 
@@ -665,7 +675,9 @@ public class MainActivity extends Activity {
         // ---- camera name ----
         LinearLayout nameBox = Ps2Ui.section(this, settingsList, "Camera name");
         TextView nameHint = Ps2Ui.text(this,
-                cameraSerial.isEmpty()
+                camList().size() > 1
+                        ? "Name for the main camera (CAM " + (main == null ? 1 : main.number()) + "). Tap another picture on the Camera tab to name that one."
+                        : cameraSerial.isEmpty()
                         ? "Used in file names and photo info. Both EyeToys look identical to the phone, so set this when you swap cameras."
                         : "Used in file names and photo info. Remembered for this camera.",
                 12, Ps2Ui.DIM, false);
@@ -707,6 +719,24 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams nfl = new LinearLayout.LayoutParams(MATCH, WRAP);
         nfl.topMargin = dp(8);
         nameBox.addView(nameField, nfl);
+
+        // ---- several cameras ----
+        LinearLayout multi = Ps2Ui.section(this, settingsList, "Cameras");
+        multi.addView(Ps2Ui.segmentRow(this, "Layout with more than one camera",
+                "Auto stacks two cameras and uses a 2\u00D72 grid for three or four. Tap a picture to make it the main camera, the one that records and takes photos.",
+                new String[]{"Auto", "Stacked", "Grid"}, prefs.i("multi_layout", CamGrid.AUTO), i -> {
+                    prefs.putI("multi_layout", i);
+                    layoutTiles();
+                }));
+        multi.addView(Ps2Ui.toggleRow(this, "Share USB bandwidth",
+                "Turn on if a second camera won't start through your hub. Every camera then uses a smaller stream at up to 10 fps. Restarts the cameras.",
+                prefs.b("usb_share", false), on -> {
+                    prefs.putB("usb_share", on);
+                    if (streaming) {
+                        if (isRecording()) log("Sharing applies after you stop recording and reconnect.");
+                        else restartCamera();
+                    }
+                }));
 
         // ---- video ----
         LinearLayout vid = Ps2Ui.section(this, settingsList, "Video");
@@ -780,6 +810,7 @@ public class MainActivity extends Activity {
         disc.setGravity(Gravity.CENTER);
         disc.setPadding(0, dp(11), 0, dp(11));
         disc.setBackground(Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 8));
+        disc.setText(camList().size() > 1 ? "DISCONNECT ALL CAMERAS" : "DISCONNECT CAMERA");
         disc.setOnClickListener(v -> worker.execute(this::stopAll));
         LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(MATCH, WRAP);
         dl.topMargin = dp(10);
@@ -816,11 +847,21 @@ public class MainActivity extends Activity {
 
     private String cameraInfo() {
         StringBuilder sb = new StringBuilder();
-        if (currentDevice != null && streaming) {
+        java.util.List<Cam> list = camList();
+        Cam m = main;
+        if (m != null && streaming) {
             sb.append("Sony EyeToy USB camera (054c:0155)\n");
             sb.append("Chip: OV519    Sensor: ").append(sensorName.isEmpty() ? "?" : sensorName).append("\n");
             sb.append("Picture: 640 x 480 (").append(Metadata.megapixels(640, 480)).append("), JPEG\n");
             sb.append("Camera ID: ").append(cameraSerial.isEmpty() ? "none given by the camera" : cameraSerial).append("\n");
+            if (list.size() > 1) {
+                sb.append("\nCameras running: ").append(list.size()).append("\n");
+                for (Cam c : list) {
+                    sb.append(String.format(Locale.US, "Cam %d%s: %s, %d bytes/packet, %d fps set%s\n", c.number(),
+                            c == m ? " (main)" : "", prefs.s("label_" + c.key(), "EyeToy"), c.psize, c.fps,
+                            c.serial.isEmpty() ? "" : ", ID " + c.serial));
+                }
+            }
         } else {
             sb.append("No camera connected.\n");
         }
@@ -906,16 +947,111 @@ public class MainActivity extends Activity {
         applyLookToPreview();
         updateModeUi();
         logView.setText(logText);
+        layoutTiles();
         if (streaming) onCameraLive(); else onCameraGone();
         showPage(page < 0 ? PAGE_CAMERA : page);
     }
 
     private void applyLookToPreview() {
-        preview.setScaleX((look.mirror ? -1f : 1f) * look.zoom);
-        preview.setScaleY((look.flip ? -1f : 1f) * look.zoom);
-        preview.setColorFilter(look.filter());
+        for (Cam c : camList()) if (c.view != null) applyLook(c.view);
         paintButton(mirrorBtn, look.mirror);
         paintButton(flipBtn, look.flip);
+    }
+
+    private void applyLook(ImageView v) {
+        v.setScaleX((look.mirror ? -1f : 1f) * look.zoom);
+        v.setScaleY((look.flip ? -1f : 1f) * look.zoom);
+        v.setColorFilter(look.filter());
+    }
+
+    // ------------------------------------------------------------------ camera tiles
+
+    /** Running cameras in slot order. */
+    private java.util.List<Cam> camList() {
+        java.util.List<Cam> l = new java.util.ArrayList<>();
+        synchronized (cams) {
+            for (Cam c : cams) if (c != null) l.add(c);
+        }
+        return l;
+    }
+
+    /**
+     * (Re)builds one picture tile per running camera, shapes the frame for the chosen
+     * layout, and puts the wave ring on the main camera. UI thread.
+     */
+    private void layoutTiles() {
+        if (grid == null) return;
+        java.util.List<Cam> list = camList();
+        grid.removeAllViews();
+        if (waveRing.getParent() != null) ((ViewGroup) waveRing.getParent()).removeView(waveRing);
+        boolean multi = list.size() > 1;
+        Cam m = main;
+        for (Cam c : list) {
+            FrameLayout tile = new FrameLayout(this);
+            boolean isMain = c == m;
+            int pad = multi ? dp(2) : 0;
+            tile.setPadding(pad, pad, pad, pad);
+            tile.setBackgroundColor(multi && isMain ? Ps2Ui.CYAN : 0xFF000000);
+            FrameLayout inner = new FrameLayout(this);
+            inner.setBackgroundColor(0xFF000000);
+            inner.setClipChildren(true);
+            tile.addView(inner, new FrameLayout.LayoutParams(MATCH, MATCH));
+            ImageView v = new ImageView(this);
+            v.setScaleType(ImageView.ScaleType.FIT_XY);
+            if (c.view != null && c.view.getDrawable() != null) v.setImageDrawable(c.view.getDrawable());
+            applyLook(v);
+            inner.addView(v, new FrameLayout.LayoutParams(MATCH, MATCH));
+            TextView lb = Ps2Ui.hud(this, tileText(c, isMain), 11, Ps2Ui.HUD);
+            lb.setPadding(dp(6), dp(2), dp(6), dp(2));
+            lb.setBackground(Ps2Ui.panel(this, 0x88000000, 0, 4));
+            lb.setVisibility(multi ? View.VISIBLE : View.GONE);
+            FrameLayout.LayoutParams ll = new FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+            ll.bottomMargin = dp(4);
+            inner.addView(lb, ll);
+            if (isMain) inner.addView(waveRing, new FrameLayout.LayoutParams(MATCH, MATCH));
+            c.tile = tile;
+            c.view = v;
+            c.label = lb;
+            grid.addView(tile);
+        }
+        if (waveRing.getParent() == null) screen.addView(waveRing, screen.indexOfChild(grid) + 1,
+                new FrameLayout.LayoutParams(MATCH, MATCH));
+        grid.setShape(list.size(), prefs.i("multi_layout", CamGrid.AUTO));
+        previewFrame.setRatio(grid.ratio());
+    }
+
+    private String tileText(Cam c, boolean isMain) {
+        return "CAM " + c.number() + (isMain ? " \u25CF MAIN" : "") + (c.live ? " \u00B7 " + c.liveFps + " FPS" : "");
+    }
+
+    /** Tapping a picture makes that camera the main one (the one that records and takes photos). */
+    private void onTileTapped(int index) {
+        java.util.List<Cam> list = camList();
+        if (list.size() < 2 || index < 0 || index >= list.size()) return;
+        Cam c = list.get(index);
+        if (c == main) return;
+        if (isRecording() || countingDown || saveOverlay.isShowing()) {
+            Toast.makeText(this, "Stop recording first, then pick another camera.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        setMain(c);
+        log("Camera " + c.number() + " is now the main camera.");
+        layoutTiles();
+        if (currentPage == PAGE_SETTINGS) fillSettings();
+    }
+
+    /** Makes c the camera that records, takes photos and watches for waves (null when none is left). */
+    private void setMain(Cam c) {
+        main = c;
+        lastGoodJpeg = null;
+        framesShown = 0;
+        framesBad = 0;
+        wave.reset();
+        if (c != null) {
+            sensorName = c.sensorName;
+            cameraSerial = c.serial;
+            cameraKey = c.key();
+        }
     }
 
     private void setFlip(boolean on) {
@@ -987,7 +1123,7 @@ public class MainActivity extends Activity {
 
     private void onCameraGone() {
         noCamera.setVisibility(View.VISIBLE);
-        preview.setImageDrawable(null);
+        layoutTiles();
         waveRing.setActive(false);
         hudLive = "";
         setHudVisible(false);
@@ -1041,6 +1177,10 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ USB setup
 
+    private static boolean isEyeToy(UsbDevice d) {
+        return d != null && d.getVendorId() == SONY_VID && (d.getProductId() == 0x0155 || d.getProductId() == 0x0154);
+    }
+
     private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -1049,63 +1189,100 @@ public class MainActivity extends Activity {
                     ? intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class)
                     : intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
             if (ACTION_PERMISSION.equals(a)) {
+                permAsking = false;
                 if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
                     log("Permission granted.");
                     if (d == null) d = findEyeToy(false);
                     UsbDevice dev = d;
                     if (dev != null) worker.execute(() -> openAndStart(dev));
                 } else {
+                    if (d != null) pending.remove(d.getDeviceName());
                     log("Permission was refused. Tap Connect and choose Allow.");
+                }
+                askNextPermission();
+            } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(a)) {
+                // another camera plugged in (into the hub) while the app is open
+                if (isEyeToy(d) && findCam(d.getDeviceName()) == null && !pending.contains(d.getDeviceName())) {
+                    log("EyeToy plugged in.");
+                    connect();
                 }
             } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(a)) {
                 if (d != null && d.getVendorId() == SONY_VID) {
-                    log("EyeToy unplugged.");
-                    worker.execute(MainActivity.this::stopAll);
+                    pending.remove(d.getDeviceName());
+                    final Cam c = findCam(d.getDeviceName());
+                    if (c != null) {
+                        log(camList().size() > 1 ? "Camera " + c.number() + " unplugged." : "EyeToy unplugged.");
+                        worker.execute(() -> stopCam(c));
+                    }
                 }
             }
         }
     };
 
-    private UsbDevice findEyeToy(boolean verbose) {
-        for (UsbDevice d : usb.getDeviceList().values()) {
-            if (verbose) log(String.format("  USB device found: %04x:%04x %s", d.getVendorId(), d.getProductId(),
-                    d.getProductName() == null ? "" : d.getProductName()));
-            if (d.getVendorId() == SONY_VID && (d.getProductId() == 0x0155 || d.getProductId() == 0x0154)) return d;
+    private Cam findCam(String devName) {
+        synchronized (cams) {
+            for (Cam c : cams) if (c != null && c.devName.equals(devName)) return c;
         }
         return null;
     }
 
+    private UsbDevice findEyeToy(boolean verbose) {
+        java.util.List<UsbDevice> all = findEyeToys(verbose);
+        return all.isEmpty() ? null : all.get(0);
+    }
+
+    /** Every EyeToy on the bus (directly or through a hub), in a stable order. */
+    private java.util.List<UsbDevice> findEyeToys(boolean verbose) {
+        java.util.List<UsbDevice> out = new java.util.ArrayList<>();
+        for (UsbDevice d : usb.getDeviceList().values()) {
+            if (verbose) log(String.format("  USB device found: %04x:%04x %s", d.getVendorId(), d.getProductId(),
+                    d.getProductName() == null ? "" : d.getProductName()));
+            if (isEyeToy(d)) out.add(d);
+        }
+        java.util.Collections.sort(out, (x, y) -> x.getDeviceName().compareTo(y.getDeviceName()));
+        return out;
+    }
+
+    /** Starts every EyeToy that isn't running yet, asking for permission one camera at a time. */
     private void connect() {
-        if (streaming) { log("Already streaming."); return; }
-        log("Looking for the EyeToy...");
+        log("Looking for EyeToys...");
         if (usb.getDeviceList().isEmpty()) {
             log("No USB devices at all. Check the adapter is plugged in fully, and that the phone isn't in charge-only mode.");
             Toast.makeText(this, "No camera found. Check the adapter.", Toast.LENGTH_SHORT).show();
             return;
         }
-        UsbDevice d = findEyeToy(true);
-        if (d == null) {
+        java.util.List<UsbDevice> found = findEyeToys(true);
+        if (found.isEmpty()) {
             log("Didn't find an EyeToy (054c:0155) in the list above.");
             Toast.makeText(this, "No EyeToy found.", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (usb.hasPermission(d)) {
-            worker.execute(() -> openAndStart(d));
-        } else {
-            log("Asking for permission to use the camera...");
-            Intent i = new Intent(ACTION_PERMISSION).setPackage(getPackageName());
-            int flags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
-            usb.requestPermission(d, PendingIntent.getBroadcast(this, 0, i, flags));
+        if (found.size() > 1) log(found.size() + " EyeToys found.");
+        int started = 0;
+        for (UsbDevice d : found) {
+            String name = d.getDeviceName();
+            if (findCam(name) != null || !pending.add(name)) continue;
+            started++;
+            if (usb.hasPermission(d)) {
+                worker.execute(() -> openAndStart(d));
+            } else {
+                permQueue.add(d);
+            }
         }
+        if (started == 0) log(found.size() > 1 ? "All cameras are already running." : "Already streaming (or starting).");
+        askNextPermission();
     }
 
-    private static String epType(int t) {
-        switch (t) {
-            case UsbConstants.USB_ENDPOINT_XFER_ISOC: return "iso";
-            case UsbConstants.USB_ENDPOINT_XFER_BULK: return "bulk";
-            case UsbConstants.USB_ENDPOINT_XFER_INT: return "int";
-            default: return "ctrl";
-        }
+    /** Android shows one permission box at a time, so cameras are asked about in turn. UI thread. */
+    private void askNextPermission() {
+        if (permAsking) return;
+        UsbDevice d = permQueue.poll();
+        if (d == null) return;
+        permAsking = true;
+        log("Asking for permission to use the camera...");
+        Intent i = new Intent(ACTION_PERMISSION).setPackage(getPackageName());
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+        usb.requestPermission(d, PendingIntent.getBroadcast(this, 0, i, flags));
     }
 
     /** The frame rate the camera itself should run at right now. */
@@ -1113,170 +1290,173 @@ public class MainActivity extends Activity {
         return Prefs.MODE_TIMELAPSE.equals(mode) ? 5 : prefs.fps();
     }
 
+    /** Stops and reopens every camera (main one first, so it gets the most USB bandwidth). */
     private void restartCamera() {
-        final UsbDevice d = currentDevice;
         worker.execute(() -> {
+            java.util.List<UsbDevice> devs = new java.util.ArrayList<>();
+            Cam m = main;
+            if (m != null) devs.add(m.dev);
+            for (Cam c : camList()) if (c != m) devs.add(c.dev);
             stopAll();
-            if (d != null) openAndStart(d);
+            for (UsbDevice d : devs) {
+                pending.add(d.getDeviceName());
+                openAndStart(d);
+            }
+            Cam first = m == null ? null : findCam(m.devName);
+            if (first != null && first != main) {
+                setMain(first);
+                ui.post(this::layoutTiles);
+            }
         });
+    }
+
+    private int freeSlot() {
+        synchronized (cams) {
+            for (int i = 0; i < cams.length; i++) if (cams[i] == null) return i;
+        }
+        return -1;
     }
 
     /** Runs on the worker thread. */
     private void openAndStart(UsbDevice d) {
-        if (streaming) return;
         try {
-            log("Opening camera...");
-            String serial = null;
-            try { serial = d.getSerialNumber(); } catch (Exception ignored) { }
-            cameraSerial = serial == null ? "" : serial;
-            cameraKey = cameraSerial.isEmpty() ? "default" : cameraSerial;
-            log("Camera ID: " + (cameraSerial.isEmpty() ? "(none given)" : cameraSerial)
-                    + " · " + d.getManufacturerName() + " / " + d.getProductName());
-
-            conn = usb.openDevice(d);
-            if (conn == null) { log("Couldn't open the camera (openDevice returned nothing)."); return; }
-
-            UsbInterface best = null;
-            UsbEndpoint bestEp = null;
-            intfAlt0 = null;
-            for (int i = 0; i < d.getInterfaceCount(); i++) {
-                UsbInterface it = d.getInterface(i);
-                StringBuilder sb = new StringBuilder(String.format("  interface %d alt %d class %d:", it.getId(),
-                        it.getAlternateSetting(), it.getInterfaceClass()));
-                for (int e = 0; e < it.getEndpointCount(); e++) {
-                    UsbEndpoint ep = it.getEndpoint(e);
-                    sb.append(String.format(" [ep 0x%02x %s %s %d]", ep.getAddress(), epType(ep.getType()),
-                            ep.getDirection() == UsbConstants.USB_DIR_IN ? "in" : "out", ep.getMaxPacketSize()));
-                    if (it.getId() == 0 && ep.getType() == UsbConstants.USB_ENDPOINT_XFER_ISOC
-                            && ep.getDirection() == UsbConstants.USB_DIR_IN
-                            && (bestEp == null || (ep.getMaxPacketSize() & 0x7ff) > (bestEp.getMaxPacketSize() & 0x7ff))) {
-                        best = it;
-                        bestEp = ep;
-                    }
-                }
-                log(sb.toString());
-                if (it.getId() == 0 && it.getAlternateSetting() == 0) intfAlt0 = it;
-            }
-            if (intfAlt0 == null || best == null) {
-                log("Couldn't find the video stream on interface 0.");
-                closeConn();
+            if (findCam(d.getDeviceName()) != null) return;
+            int slot = freeSlot();
+            if (slot < 0) {
+                log("This app shows up to " + IsoStream.MAX_SLOTS + " cameras at once; this one is left off.");
                 return;
             }
-            if (!conn.claimInterface(intfAlt0, true)) {
-                log("Couldn't claim the video interface.");
-                closeConn();
+            final Cam c = new Cam(slot, d);
+            final int n = c.number();
+            EyeToyDriver.Logger clog = slot == 0 && camList().isEmpty() ? this::log : m -> log("Cam " + n + ": " + m);
+            clog.log("Opening camera...");
+            clog.log("Camera ID: " + (c.serial.isEmpty() ? "(none given)" : c.serial)
+                    + " · " + d.getManufacturerName() + " / " + d.getProductName() + " · USB " + c.devName);
+            int want = camFps();
+            boolean ok = false;
+            try {
+                ok = c.open(usb, want, prefs.b("usb_share", false), clog);
+            } catch (Exception e) {
+                clog.log("ERROR: " + e.getMessage());
+                Log.e(TAG, "open", e);
+            }
+            if (!ok) {
+                c.close();
                 return;
             }
-
-            driver = new EyeToyDriver(conn, this::log);
-            if (!driver.init()) {
-                log("Camera setup stopped. Open the Log tab, tap Copy log and send it to Claude.");
-                closeConn();
-                return;
+            synchronized (cams) { cams[slot] = c; }
+            if (main == null) {
+                startedFps = want;
+                setMain(c);
             }
-            sensorName = driver.sensorName;
-
-            int psize = bestEp.getMaxPacketSize() & 0x7ff;
-            log(String.format("Selecting stream setting alt %d (packet size %d).", best.getAlternateSetting(), psize));
-            if (!conn.setInterface(best)) {
-                log("Android refused to switch to that stream setting.");
-                closeConn();
-                return;
-            }
-
-            currentDevice = d;
-            startedFps = camFps();
-            driver.start(startedFps);
-
-            int r = IsoStream.nativeStart(conn.getFileDescriptor(), bestEp.getAddress(), psize);
-            if (r != 0) {
-                log("Couldn't start the USB stream (error " + r + ").");
-                driver.stop();
-                closeConn();
-                return;
-            }
-            log("USB stream running. Waiting for pictures...");
-            framesShown = 0;
-            framesBad = 0;
-            wave.reset();
+            clog.log("USB stream running. Waiting for pictures...");
             streaming = true;
-            frameThread = new Thread(this::frameLoop, "frames");
-            frameThread.start();
-        } catch (Exception e) {
-            log("ERROR: " + e.getMessage());
-            Log.e(TAG, "openAndStart", e);
-            stopAll();
+            ui.post(this::layoutTiles);
+            c.running = true;
+            c.thread = new Thread(() -> frameLoop(c), "frames" + n);
+            c.thread.start();
+        } finally {
+            pending.remove(d.getDeviceName());
         }
     }
 
     // ------------------------------------------------------------------ frames
 
-    private void frameLoop() {
+    private static Bitmap decode(byte[] f, int sample) {
+        try {
+            if (sample <= 1) return BitmapFactory.decodeByteArray(f, 0, f.length);
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inSampleSize = sample;
+            return BitmapFactory.decodeByteArray(f, 0, f.length, o);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** One per camera. Every camera feeds its own picture; only the main one records, takes photos and sees waves. */
+    private void frameLoop(Cam c) {
         long lastStatus = 0, started = System.currentTimeMillis();
         int lastShown = 0;
-        boolean warnedNoData = false, loggedFirst = false;
-        while (streaming) {
-            byte[] f = IsoStream.nativeGetFrame();
+        boolean warnedNoData = false;
+        String tag = "Cam " + c.number() + ": ";
+        while (c.running) {
+            byte[] f = IsoStream.nativeGetFrame(c.slot);
             long now = System.currentTimeMillis();
             if (f != null) {
-                Bitmap bmp = decode(f);
+                boolean isMain = c == main;
+                // side cameras are shown small, so half size is plenty and decodes faster
+                int sample = isMain || camList().size() < 2 ? 1 : 2;
+                Bitmap bmp = decode(f, sample);
                 byte[] used = f;
                 if (bmp == null && JpegFix.looksLikeJpeg(f)) {
                     byte[] fixed = JpegFix.addHuffmanTables(f);
                     if (fixed != f) {
-                        bmp = decode(fixed);
+                        bmp = decode(fixed, sample);
                         used = fixed;
                     }
                 }
                 if (bmp != null) {
-                    framesShown++;
-                    lastGoodJpeg = used;
-                    if (!loggedFirst) {
-                        loggedFirst = true;
-                        log("First picture received! " + bmp.getWidth() + "x" + bmp.getHeight()
+                    c.framesShown++;
+                    if (!c.live) {
+                        c.live = true;
+                        log((camList().size() > 1 ? tag : "") + "First picture received! " + bmp.getWidth() + "x" + bmp.getHeight()
                                 + (used != f ? " (needed Huffman tables added)" : ""));
-                        ui.post(this::onCameraLive);
+                        ui.post(() -> {
+                            onCameraLive();
+                            layoutTiles();
+                        });
                     }
-                    Recorder rec = recorder;
-                    if (rec != null && rec.isRunning()) {
-                        if (rec.isTimelapse()) {
-                            long every = TL_SECONDS[prefs.i("tl_idx", 2)] * 1000L;
-                            if (now - lastTlMs >= every) {
-                                lastTlMs = now;
+                    if (isMain) {
+                        framesShown++;
+                        lastGoodJpeg = used;
+                        Recorder rec = recorder;
+                        if (rec != null && rec.isRunning()) {
+                            if (rec.isTimelapse()) {
+                                long every = TL_SECONDS[prefs.i("tl_idx", 2)] * 1000L;
+                                if (now - lastTlMs >= every) {
+                                    lastTlMs = now;
+                                    rec.drawFrame(bmp);
+                                }
+                            } else {
                                 rec.drawFrame(bmp);
                             }
-                        } else {
-                            rec.drawFrame(bmp);
                         }
+                        if (prefs.b("wave", true) && !saveOverlay.isShowing() && !countingDown) detectWave(bmp, now);
                     }
-                    if (prefs.b("wave", true) && !saveOverlay.isShowing() && !countingDown) detectWave(bmp, now);
                     final Bitmap show = bmp;
-                    ui.post(() -> preview.setImageBitmap(show));
+                    ui.post(() -> {
+                        if (c.view != null) c.view.setImageBitmap(show);
+                    });
                 } else {
-                    framesBad++;
-                    if (framesBad <= 3)
-                        log("Frame " + f.length + " bytes couldn't be decoded. Starts: " + JpegFix.hex(f, 24));
+                    c.framesBad++;
+                    if (c == main) framesBad++;
+                    if (c.framesBad <= 3)
+                        log(tag + "Frame " + f.length + " bytes couldn't be decoded. Starts: " + JpegFix.hex(f, 24));
                 }
             } else {
                 try { Thread.sleep(10); } catch (InterruptedException ignored) { }
             }
 
             if (now - lastStatus >= 1000) {
-                long[] s = IsoStream.nativeStats();
-                final int fps = framesShown - lastShown;
-                lastShown = framesShown;
+                long[] s = IsoStream.nativeStats(c.slot);
+                final int fps = c.framesShown - lastShown;
+                lastShown = c.framesShown;
                 lastStatus = now;
-                statusTick(fps, s);
-                if (!warnedNoData && now - started > 5000 && framesShown == 0) {
+                c.liveFps = fps;
+                if (c == main) statusTick(fps, s);
+                ui.post(() -> {
+                    if (c.label != null) c.label.setText(tileText(c, c == main));
+                });
+                if (!warnedNoData && now - started > 5000 && c.framesShown == 0) {
                     warnedNoData = true;
-                    log(String.format(Locale.US, "No picture after 5s. urbs %d, packets %d, data packets %d, bytes %d, frames %d, dropped %d, pkt errors %d, reap errors %d, submit errors %d, last errno %d",
+                    log(String.format(Locale.US, tag + "No picture after 5s. urbs %d, packets %d, data packets %d, bytes %d, frames %d, dropped %d, pkt errors %d, reap errors %d, submit errors %d, last errno %d",
                             s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]));
-                    log(IsoStream.nativeDebug());
+                    log(IsoStream.nativeDebug(c.slot));
                     log("Open the Log tab, tap Copy log and send it to Claude.");
                 }
-                if (!IsoStream.nativeIsRunning()) {
-                    log("USB stream stopped by itself (errno " + s[9] + ").");
-                    worker.execute(this::stopAll);
+                if (!IsoStream.nativeIsRunning(c.slot)) {
+                    log(tag + "USB stream stopped by itself (errno " + s[9] + ").");
+                    worker.execute(() -> stopCam(c));
                     break;
                 }
             }
@@ -1316,14 +1496,6 @@ public class MainActivity extends Activity {
         status(String.format(Locale.US,
                 "Streaming · %d fps · shown %d · bad %d · frames %d · dropped %d · data packets %d · KB %d · pkt err %d",
                 fps, framesShown, framesBad, s[4], s[5], s[2], s[3] / 1024, s[6]));
-    }
-
-    private static Bitmap decode(byte[] f) {
-        try {
-            return BitmapFactory.decodeByteArray(f, 0, f.length);
-        } catch (Throwable t) {
-            return null;
-        }
     }
 
     private static int luma(int px) {
@@ -1679,7 +1851,8 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------------ camera light
 
     private void startLedBlink() {
-        final EyeToyDriver d = driver;
+        final Cam m = main;
+        final EyeToyDriver d = m == null ? null : m.driver;
         if (d == null || !prefs.b("blink_led", false) || ledBlinking) return;
         ledBlinking = true;
         ledThread = new Thread(() -> {
@@ -1706,16 +1879,37 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------------ teardown
 
-    private void closeConn() {
-        if (conn != null) {
-            try {
-                if (intfAlt0 != null) {
-                    conn.setInterface(intfAlt0);
-                    conn.releaseInterface(intfAlt0);
-                }
-            } catch (Exception ignored) { }
-            conn.close();
-            conn = null;
+    /** Stops one camera; if it was the main one, the next camera takes over. Worker thread. */
+    private void stopCam(Cam c) {
+        if (c == main) {
+            stopRecording();
+            stopLedBlink();
+        }
+        c.running = false;
+        if (c.thread != null && c.thread != Thread.currentThread()) {
+            try { c.thread.join(1000); } catch (InterruptedException ignored) { }
+        }
+        c.thread = null;
+        c.close();
+        synchronized (cams) {
+            if (cams[c.slot] == c) cams[c.slot] = null;
+        }
+        java.util.List<Cam> left = camList();
+        if (c == main) {
+            setMain(left.isEmpty() ? null : left.get(0));
+            if (!left.isEmpty()) log("Camera " + left.get(0).number() + " is now the main camera.");
+        }
+        if (left.isEmpty()) {
+            boolean was = streaming;
+            streaming = false;
+            if (was) log("Stopped.");
+            status("Not connected");
+            ui.post(this::onCameraGone);
+        } else {
+            ui.post(() -> {
+                layoutTiles();
+                if (currentPage == PAGE_SETTINGS) fillSettings();
+            });
         }
     }
 
@@ -1724,15 +1918,13 @@ public class MainActivity extends Activity {
         stopRecording();
         stopLedBlink();
         boolean was = streaming;
+        // side cameras first, so the main one is never handed over on the way out
+        java.util.List<Cam> list = camList();
+        Cam m = main;
+        for (Cam c : list) if (c != m) stopCam(c);
+        if (m != null) stopCam(m);
         streaming = false;
-        if (frameThread != null) {
-            try { frameThread.join(1000); } catch (InterruptedException ignored) { }
-            frameThread = null;
-        }
-        IsoStream.nativeStop();
-        if (driver != null) { driver.stop(); driver = null; }
-        closeConn();
-        if (was) log("Stopped.");
+        if (was && list.isEmpty()) log("Stopped.");
         status("Not connected");
         ui.post(this::onCameraGone);
     }

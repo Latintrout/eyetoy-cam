@@ -4,21 +4,43 @@ import android.content.Context;
 import android.view.View;
 import android.widget.FrameLayout;
 
-/** A frame that is always 4:3 (the EyeToy's picture shape), as large as fits. */
+/**
+ * A frame that keeps a fixed shape, as large as fits: 4:3 (the EyeToy's picture
+ * shape) for one camera, or the shape of the camera grid for several.
+ */
 final class AspectLayout extends FrameLayout {
-    private static final float RATIO = 4f / 3f;
+    private float ratio = 4f / 3f;
 
     AspectLayout(Context c) { super(c); }
 
+    private boolean fill;
+
+    /** When on, the frame just takes the size its parent gives it (used for several cameras). */
+    void setFill(boolean on) {
+        if (on == fill) return;
+        fill = on;
+        requestLayout();
+    }
+
+    void setRatio(float r) {
+        if (r == ratio) return;
+        ratio = r;
+        requestLayout();
+    }
+
     @Override
     protected void onMeasure(int wSpec, int hSpec) {
+        if (fill) {
+            super.onMeasure(wSpec, hSpec);
+            return;
+        }
         int w = View.MeasureSpec.getSize(wSpec);
         int hMode = View.MeasureSpec.getMode(hSpec);
         int hMax = View.MeasureSpec.getSize(hSpec);
-        int h = Math.round(w / RATIO);
+        int h = Math.round(w / ratio);
         if (hMode != View.MeasureSpec.UNSPECIFIED && h > hMax) {
             h = hMax;
-            w = Math.round(h * RATIO);
+            w = Math.round(h * ratio);
         }
         super.onMeasure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
                 View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY));

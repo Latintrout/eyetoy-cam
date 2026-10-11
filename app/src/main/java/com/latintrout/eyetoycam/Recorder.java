@@ -24,6 +24,8 @@ import android.provider.MediaStore;
 import android.view.Surface;
 
 import java.nio.ByteBuffer;
+import java.text.SimpleDateFormat;
+import java.util.Date;
 import java.util.Locale;
 
 /**
@@ -54,6 +56,14 @@ final class Recorder {
     private AudioRecord audio;
     private Thread videoThread, audioThread;
     private Look look;
+    private boolean burn;
+    private String burnLine1 = "", burnLine2 = "";
+    private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint textShadow = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final SimpleDateFormat dateFmt = new SimpleDateFormat("MMM dd yyyy", Locale.US);
+    private final SimpleDateFormat timeFmt = new SimpleDateFormat("hh:mm:ss a", Locale.US);
+    private long burnSecond = -1;
+    private String burnDate = "", burnTime = "";
 
     private int vTrack = -1, aTrack = -1;
     private boolean muxStarted;
@@ -75,15 +85,32 @@ final class Recorder {
     long elapsedMs() { return running ? (System.nanoTime() - startNs) / 1_000_000 : 0; }
     /** File name if the video was saved successfully, otherwise null. */
     String savedName() { return saved ? fileName : null; }
+    /** Where the video was saved, or null if it wasn't. */
+    Uri savedUri() { return saved ? uri : null; }
 
     void start(Context ctx, int w, int h, int fps, boolean wantAudio, Look lk, String baseName,
-               String description, boolean tl, int timelapseFps) throws Exception {
+               String description, boolean tl, int timelapseFps,
+               boolean burnDetails, String cameraName) throws Exception {
         width = w;
         height = h;
         look = lk;
         timelapse = tl;
         outFps = timelapseFps;
         dst.set(0, 0, w, h);
+        burn = burnDetails;
+        if (burn) {
+            // size, frame rate and camera name, top-left; date and time, bottom-left
+            burnLine1 = w + "\u00D7" + h;
+            burnLine2 = (tl ? "" : fps + " FPS \u00B7 ") + cameraName.toUpperCase(Locale.US);
+            float px = h / 480f;
+            textPaint.setColor(0xFFF4F6FA);
+            textPaint.setTypeface(android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE,
+                    android.graphics.Typeface.BOLD));
+            textPaint.setTextSize(20f * px);
+            textShadow.setColor(0xCC000000);
+            textShadow.setTypeface(textPaint.getTypeface());
+            textShadow.setTextSize(20f * px);
+        }
         cr = ctx.getContentResolver();
         fileName = baseName + ".mp4";
 
@@ -183,10 +210,12 @@ final class Recorder {
             try {
                 c.drawColor(Color.BLACK);
                 c.save();
-                c.scale(look.mirror ? -1f : 1f, look.flip ? -1f : 1f, width / 2f, height / 2f);
+                float z = look.zoom;
+                c.scale((look.mirror ? -1f : 1f) * z, (look.flip ? -1f : 1f) * z, width / 2f, height / 2f);
                 paint.setColorFilter(look.filter());
                 c.drawBitmap(bmp, null, dst, paint);
                 c.restore();
+                if (burn) drawDetails(c);
             } finally {
                 inSurface.unlockCanvasAndPost(c);
             }
@@ -194,6 +223,28 @@ final class Recorder {
         } catch (Exception e) {
             // a dropped frame is not worth stopping the recording for
         }
+    }
+
+    /** The on-picture details, drawn after mirror/flip so the words never come out backwards. */
+    private void drawDetails(Canvas c) {
+        long sec = System.currentTimeMillis() / 1000;
+        if (sec != burnSecond) {
+            Date now = new Date();
+            burnDate = dateFmt.format(now).toUpperCase(Locale.US);
+            burnTime = timeFmt.format(now);
+            burnSecond = sec;
+        }
+        float px = height / 480f, m = 16f * px, line = 26f * px;
+        text(c, burnLine1, m, m + line * 0.8f);
+        text(c, burnLine2, m, m + line * 1.8f);
+        text(c, burnDate, m, height - m - line);
+        text(c, burnTime, m, height - m);
+    }
+
+    private void text(Canvas c, String s, float x, float y) {
+        float o = Math.max(1f, height / 240f);
+        c.drawText(s, x + o, y + o, textShadow);
+        c.drawText(s, x, y, textPaint);
     }
 
     // ---- muxer helpers ----

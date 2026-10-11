@@ -24,7 +24,7 @@ final class WaveRing extends View {
         arc.setStyle(Paint.Style.STROKE);
         arc.setStrokeWidth(5 * d);
         arc.setStrokeCap(Paint.Cap.ROUND);
-        arc.setColor(Ps2Ui.CYAN);
+        arc.setColor(Ps2Ui.HUD_ACCENT);
         label.setColor(0xCCFFFFFF);
         label.setTextAlign(Paint.Align.CENTER);
         label.setTextSize(10 * d * 1.5f);

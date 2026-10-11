@@ -35,6 +35,8 @@ import android.provider.MediaStore;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.util.Log;
+import android.util.Size;
+import android.view.ScaleGestureDetector;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -64,6 +66,9 @@ public class MainActivity extends Activity {
     private static final int[] TL_SECONDS = {1, 2, 5, 10, 30, 60};
     private static final String[] TL_NAMES = {"1 s", "2 s", "5 s", "10 s", "30 s", "1 min"};
     private static final int TL_OUT_FPS = 30;
+    private static final int[] TIMER_S = {0, 3, 5, 10};
+    private static final String[] SPLIT_NAMES = {"Off", "5 min", "10 min", "30 min"};
+    private static final int[] SPLIT_MIN = {0, 5, 10, 30};
     private static final long MIN_FREE_BYTES = 300L * 1024 * 1024;
     private static final int PAGE_CAMERA = 0, PAGE_SETTINGS = 1, PAGE_LOG = 2;
     private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
@@ -104,22 +109,37 @@ public class MainActivity extends Activity {
     private PowerManager.OnThermalStatusChangedListener thermalListener;
 
     // ---- views ----
-    private Ps2Background background;
+    private Backdrop background;
     private LinearLayout content;
     private final View[] pages = new View[3];
     private final TextView[] tabs = new TextView[3];
+    private final IconView[] tabIcons = new IconView[3];
+    private final LinearLayout[] tabBoxes = new LinearLayout[3];
     private int currentPage = -1;
     private AspectLayout previewFrame;
     private ImageView preview;
     private LinearLayout noCamera;
     private LinearLayout recBox;
     private View recDot;
-    private TextView recSub, chip, countdownView;
+    private TextView recSub, countdownView, hudMode, hudClock, hudStore;
+    private String hudLive = "";
+    private String lastStatus = "Not connected";
+    private FocusBrackets brackets;
     private View flashView;
     private WaveRing waveRing;
     private ShutterView shutter;
     private final TextView[] modeTabs = new TextView[3];
-    private FrameLayout mirrorBtn;
+    private LinearLayout mirrorBtn, flipBtn;
+    private ImageView thumb;
+    private Bitmap lastThumb;
+    private TextView timerChip, zoomLabel;
+    private SeekBar zoomBar;
+    private ScaleGestureDetector pinch;
+    private volatile Uri lastUri;
+    private volatile boolean lastIsVideo;
+    private volatile boolean rotating;
+    private volatile boolean lastWithSound, pendingSound;
+    private volatile int recPart = 1;
     private SaveOverlay saveOverlay;
     private TextView logView, statusView;
     private ScrollView logScroll;
@@ -136,12 +156,22 @@ public class MainActivity extends Activity {
         look.mirror = prefs.b("mirror", false);
         look.flip = prefs.b("flip", false);
         look.setBrightness(prefs.i("brightness", 0));
+        look.zoom = Math.max(1f, Math.min(4f, prefs.i("zoom_pct", 100) / 100f));
+        String lu = prefs.s("last_uri", "");
+        if (!lu.isEmpty()) {
+            lastUri = Uri.parse(lu);
+            lastIsVideo = prefs.b("last_video", false);
+        }
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         buildUi();
         applyLookToPreview();
         updateModeUi();
         showPage(PAGE_CAMERA);
+        if (lastUri != null) {
+            final Uri u = lastUri;
+            worker.execute(() -> loadThumb(u));
+        }
 
         IntentFilter f = new IntentFilter();
         f.addAction(ACTION_PERMISSION);
@@ -193,10 +223,14 @@ public class MainActivity extends Activity {
     private int dp(float v) { return Ps2Ui.dp(this, v); }
 
     private void buildUi() {
+        Ps2Ui.apply(Theme.byId(prefs.s("theme", Theme.DEFAULT)));
+        applySystemBars();
+
         FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(0xFF02040F);
-        background = new Ps2Background(this);
-        root.addView(background, new FrameLayout.LayoutParams(MATCH, MATCH));
+        root.setBackgroundColor(Ps2Ui.theme.bgBottom);
+        View bg = Ps2Ui.theme.light ? new RetroBackground(this) : new NeonBackground(this);
+        background = (Backdrop) bg;
+        root.addView(bg, new FrameLayout.LayoutParams(MATCH, MATCH));
 
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
@@ -218,20 +252,36 @@ public class MainActivity extends Activity {
         LinearLayout tabBar = new LinearLayout(this);
         tabBar.setOrientation(LinearLayout.HORIZONTAL);
         String[] names = {"CAMERA", "SETTINGS", "LOG"};
+        int[] icons = {IconView.CAMERA, IconView.GEAR, IconView.LOG};
         for (int i = 0; i < 3; i++) {
             final int idx = i;
+            LinearLayout box = new LinearLayout(this);
+            box.setOrientation(LinearLayout.HORIZONTAL);
+            box.setGravity(Gravity.CENTER);
+            box.setPadding(dp(4), dp(11), dp(4), dp(11));
+            box.setOnClickListener(v -> showPage(idx));
+            IconView icon = new IconView(this, icons[i]);
+            box.addView(icon, new LinearLayout.LayoutParams(dp(18), dp(18)));
             TextView t = Ps2Ui.text(this, names[i], 13, Ps2Ui.DIM, true);
-            t.setLetterSpacing(0.16f);
-            t.setGravity(Gravity.CENTER);
-            t.setPadding(0, dp(12), 0, dp(12));
-            t.setOnClickListener(v -> showPage(idx));
+            t.setLetterSpacing(0.08f);
+            t.setSingleLine(true);
+            LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(WRAP, WRAP);
+            tl.leftMargin = dp(7);
+            box.addView(t, tl);
             tabs[i] = t;
-            tabBar.addView(t, new LinearLayout.LayoutParams(0, WRAP, 1f));
+            tabIcons[i] = icon;
+            tabBoxes[i] = box;
+            LinearLayout.LayoutParams bl = new LinearLayout.LayoutParams(0, WRAP, 1f);
+            bl.leftMargin = dp(2);
+            bl.rightMargin = dp(2);
+            tabBar.addView(box, bl);
         }
         content.addView(tabBar, new LinearLayout.LayoutParams(MATCH, WRAP));
 
         FrameLayout pageFrame = new FrameLayout(this);
-        content.addView(pageFrame, new LinearLayout.LayoutParams(MATCH, 0, 1f));
+        LinearLayout.LayoutParams pfl = new LinearLayout.LayoutParams(MATCH, 0, 1f);
+        pfl.topMargin = dp(6);
+        content.addView(pageFrame, pfl);
         pages[PAGE_CAMERA] = buildCameraPage();
         pages[PAGE_SETTINGS] = buildSettingsPage();
         pages[PAGE_LOG] = buildLogPage();
@@ -240,6 +290,25 @@ public class MainActivity extends Activity {
         saveOverlay = new SaveOverlay(this);
         root.addView(saveOverlay, new FrameLayout.LayoutParams(MATCH, MATCH));
         setContentView(root);
+    }
+
+    /** Dark status-bar icons on the light Retro look, light icons otherwise. */
+    private void applySystemBars() {
+        boolean light = Ps2Ui.theme.light;
+        if (Build.VERSION.SDK_INT >= 30) {
+            android.view.WindowInsetsController wic = getWindow().getInsetsController();
+            if (wic != null) {
+                int mask = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                        | android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                wic.setSystemBarsAppearance(light ? mask : 0, mask);
+            }
+        } else {
+            View d = getWindow().getDecorView();
+            int f = d.getSystemUiVisibility();
+            int mask = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            d.setSystemUiVisibility(light ? (f | mask) : (f & ~mask));
+        }
+        getWindow().getDecorView().setBackgroundColor(Ps2Ui.theme.bgBottom);
     }
 
     private View spacer(float weight) {
@@ -251,22 +320,29 @@ public class MainActivity extends Activity {
     private View buildCameraPage() {
         LinearLayout page = new LinearLayout(this);
         page.setOrientation(LinearLayout.VERTICAL);
-        page.addView(spacer(1f));
+        page.addView(spacer(0.5f));
 
         // ---- picture frame ----
         previewFrame = new AspectLayout(this);
-        previewFrame.setBackground(Ps2Ui.panel(this, 0xFF000000, Ps2Ui.EDGE, 10));
-        previewFrame.setClipToOutline(true);
+        // a visible frame around the picture
+        previewFrame.setBackground(Ps2Ui.panel(this, Ps2Ui.theme.light ? 0xFFB3B5BA : 0xCC040B22,
+                Ps2Ui.theme.light ? 0xFF6F7278 : Ps2Ui.CYAN, 10));
+        int fp = dp(Ps2Ui.theme.glow ? 6 : 5);
+        previewFrame.setPadding(fp, fp, fp, fp);
+        FrameLayout screen = new FrameLayout(this);
+        screen.setBackgroundColor(0xFF000000);
+        previewFrame.addView(screen, new FrameLayout.LayoutParams(MATCH, MATCH));
+
         preview = new ImageView(this);
         preview.setScaleType(ImageView.ScaleType.FIT_XY);
-        previewFrame.addView(preview, new FrameLayout.LayoutParams(MATCH, MATCH));
+        screen.addView(preview, new FrameLayout.LayoutParams(MATCH, MATCH));
 
         noCamera = new LinearLayout(this);
         noCamera.setOrientation(LinearLayout.VERTICAL);
         noCamera.setGravity(Gravity.CENTER);
-        TextView nc1 = Ps2Ui.glow(Ps2Ui.text(this, "No camera connected", 18, Ps2Ui.WHITE, true), 0x806FB5FF);
-        TextView nc2 = Ps2Ui.text(this, "Plug in your EyeToy with the USB adapter", 13, Ps2Ui.DIM, false);
-        TextView connectBtn = Ps2Ui.text(this, "CONNECT", 14, Ps2Ui.WHITE, true);
+        TextView nc1 = Ps2Ui.glow(Ps2Ui.text(this, "No camera connected", 18, Ps2Ui.HUD, true), 0x806FB5FF);
+        TextView nc2 = Ps2Ui.text(this, "Plug in your EyeToy with the USB adapter", 13, Ps2Ui.HUD_DIM, false);
+        TextView connectBtn = Ps2Ui.text(this, "CONNECT", 14, Ps2Ui.SEL_TEXT, true);
         connectBtn.setLetterSpacing(0.14f);
         connectBtn.setGravity(Gravity.CENTER);
         connectBtn.setPadding(dp(28), dp(11), dp(28), dp(11));
@@ -277,12 +353,30 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams cbl = new LinearLayout.LayoutParams(WRAP, WRAP);
         cbl.topMargin = dp(16);
         noCamera.addView(connectBtn, cbl);
-        previewFrame.addView(noCamera, new FrameLayout.LayoutParams(MATCH, MATCH));
+        screen.addView(noCamera, new FrameLayout.LayoutParams(MATCH, MATCH));
+
+        pinch = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override
+            public boolean onScale(ScaleGestureDetector d) {
+                setZoom(look.zoom * d.getScaleFactor(), true);
+                return true;
+            }
+        });
+        screen.setOnTouchListener((v, e) -> {
+            pinch.onTouchEvent(e);
+            return true;
+        });
+
+        brackets = new FocusBrackets(this);
+        brackets.setVisibility(View.GONE);
+        screen.addView(brackets, new FrameLayout.LayoutParams(MATCH, MATCH));
 
         waveRing = new WaveRing(this);
-        previewFrame.addView(waveRing, new FrameLayout.LayoutParams(MATCH, MATCH));
+        screen.addView(waveRing, new FrameLayout.LayoutParams(MATCH, MATCH));
 
-        // REC indicator, top-left
+        // ---- top-left: REC indicator, then mode / size / live info ----
+        LinearLayout topLeft = new LinearLayout(this);
+        topLeft.setOrientation(LinearLayout.VERTICAL);
         recBox = new LinearLayout(this);
         recBox.setOrientation(LinearLayout.HORIZONTAL);
         recBox.setGravity(Gravity.CENTER_VERTICAL);
@@ -296,95 +390,239 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams rtl = new LinearLayout.LayoutParams(WRAP, WRAP);
         rtl.leftMargin = dp(7);
         recBox.addView(recText, rtl);
-        recSub = Ps2Ui.text(this, "0:00", 13, Ps2Ui.WHITE, false);
+        recSub = Ps2Ui.text(this, "0:00", 13, Ps2Ui.HUD, false);
         LinearLayout.LayoutParams rsl = new LinearLayout.LayoutParams(WRAP, WRAP);
         rsl.leftMargin = dp(8);
         recBox.addView(recSub, rsl);
         recBox.setVisibility(View.GONE);
-        FrameLayout.LayoutParams rbl = new FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP | Gravity.START);
-        rbl.setMargins(dp(10), dp(10), 0, 0);
-        previewFrame.addView(recBox, rbl);
+        LinearLayout.LayoutParams rbl = new LinearLayout.LayoutParams(WRAP, WRAP);
+        rbl.bottomMargin = dp(6);
+        topLeft.addView(recBox, rbl);
+        hudMode = Ps2Ui.hud(this, "", 13, Ps2Ui.HUD);
+        hudMode.setLineSpacing(0, 1.1f);
+        topLeft.addView(hudMode);
+        FrameLayout.LayoutParams tll = new FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP | Gravity.START);
+        tll.setMargins(dp(10), dp(10), 0, 0);
+        screen.addView(topLeft, tll);
 
-        countdownView = Ps2Ui.glow(Ps2Ui.text(this, "3", 96, Ps2Ui.WHITE, true), 0xCC6FB5FF);
+        // ---- bottom corners: date / time, free storage ----
+        hudClock = Ps2Ui.hud(this, "", 13, Ps2Ui.HUD);
+        hudClock.setLineSpacing(0, 1.1f);
+        FrameLayout.LayoutParams hcl = new FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM | Gravity.START);
+        hcl.setMargins(dp(10), 0, 0, dp(10));
+        screen.addView(hudClock, hcl);
+        hudStore = Ps2Ui.hud(this, "", 12, Ps2Ui.HUD);
+        hudStore.setPadding(dp(7), dp(3), dp(7), dp(3));
+        hudStore.setBackground(Ps2Ui.panel(this, 0x66000000, 0xCCFFFFFF, 2));
+        FrameLayout.LayoutParams hsl = new FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM | Gravity.END);
+        hsl.setMargins(0, 0, dp(10), dp(10));
+        screen.addView(hudStore, hsl);
+        hudMode.setVisibility(View.GONE);
+        hudClock.setVisibility(View.GONE);
+        hudStore.setVisibility(View.GONE);
+
+        countdownView = Ps2Ui.glow(Ps2Ui.text(this, "3", 96, Ps2Ui.HUD, true), 0xCC6FB5FF);
         countdownView.setGravity(Gravity.CENTER);
         countdownView.setVisibility(View.GONE);
-        previewFrame.addView(countdownView, new FrameLayout.LayoutParams(MATCH, MATCH));
+        screen.addView(countdownView, new FrameLayout.LayoutParams(MATCH, MATCH));
 
         flashView = new View(this);
         flashView.setBackgroundColor(Color.WHITE);
         flashView.setVisibility(View.GONE);
-        previewFrame.addView(flashView, new FrameLayout.LayoutParams(MATCH, MATCH));
+        screen.addView(flashView, new FrameLayout.LayoutParams(MATCH, MATCH));
 
         page.addView(previewFrame, new LinearLayout.LayoutParams(MATCH, WRAP));
-
-        chip = Ps2Ui.text(this, "", 12, Ps2Ui.CYAN, false);
-        chip.setGravity(Gravity.CENTER);
-        chip.setLetterSpacing(0.08f);
-        LinearLayout.LayoutParams chl = new LinearLayout.LayoutParams(MATCH, WRAP);
-        chl.topMargin = dp(8);
-        page.addView(chip, chl);
+        page.addView(buildToolsRow());
         page.addView(spacer(1f));
 
         // ---- mode selector ----
         LinearLayout modeRow = new LinearLayout(this);
         modeRow.setOrientation(LinearLayout.HORIZONTAL);
         modeRow.setGravity(Gravity.CENTER);
+        modeRow.setBackground(Ps2Ui.panel(this, Ps2Ui.PANEL, Ps2Ui.EDGE, 8));
+        modeRow.setPadding(dp(3), dp(3), dp(3), dp(3));
         String[] mn = {"VIDEO", "PHOTO", "TIME-LAPSE"};
         final String[] ids = {Prefs.MODE_VIDEO, Prefs.MODE_PHOTO, Prefs.MODE_TIMELAPSE};
         for (int i = 0; i < 3; i++) {
             final int idx = i;
             TextView t = Ps2Ui.text(this, mn[i], 13, Ps2Ui.DIM, true);
-            t.setLetterSpacing(0.14f);
+            t.setLetterSpacing(0.06f);
             t.setGravity(Gravity.CENTER);
-            t.setPadding(dp(16), dp(9), dp(16), dp(9));
+            t.setSingleLine(true);
+            t.setPadding(dp(8), dp(10), dp(8), dp(10));
             t.setOnClickListener(v -> setMode(ids[idx]));
             modeTabs[i] = t;
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(WRAP, WRAP);
-            lp.leftMargin = dp(4);
-            lp.rightMargin = dp(4);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, WRAP, 1f);
+            lp.leftMargin = dp(1);
+            lp.rightMargin = dp(1);
             modeRow.addView(t, lp);
         }
         page.addView(modeRow, new LinearLayout.LayoutParams(MATCH, WRAP));
 
-        // ---- controls ----
+        // ---- controls: two buttons either side of the shutter ----
         LinearLayout controls = new LinearLayout(this);
         controls.setOrientation(LinearLayout.HORIZONTAL);
         controls.setGravity(Gravity.CENTER_VERTICAL);
 
-        FrameLayout settingsBtn = roundButton(IconView.GEAR);
+        mirrorBtn = squareButton(IconView.MIRROR, "MIRROR");
+        mirrorBtn.setOnClickListener(v -> setMirror(!look.mirror));
+        flipBtn = squareButton(IconView.FLIP, "FLIP");
+        flipBtn.setOnClickListener(v -> setFlip(!look.flip));
+        LinearLayout logBtn = squareButton(IconView.LOG, "LOG");
+        logBtn.setOnClickListener(v -> showPage(PAGE_LOG));
+        LinearLayout settingsBtn = squareButton(IconView.GEAR, "SETTINGS");
         settingsBtn.setOnClickListener(v -> showPage(PAGE_SETTINGS));
         shutter = new ShutterView(this);
         shutter.setOnClickListener(v -> onShutterClick());
-        mirrorBtn = roundButton(IconView.MIRROR);
-        mirrorBtn.setOnClickListener(v -> setMirror(!look.mirror));
 
-        controls.addView(centered(settingsBtn), new LinearLayout.LayoutParams(0, WRAP, 1f));
-        controls.addView(shutter, new LinearLayout.LayoutParams(dp(88), dp(88)));
-        controls.addView(centered(mirrorBtn), new LinearLayout.LayoutParams(0, WRAP, 1f));
+        controls.addView(buttonColumn(mirrorBtn, flipBtn), new LinearLayout.LayoutParams(0, WRAP, 1f));
+        controls.addView(shutter, new LinearLayout.LayoutParams(dp(112), dp(112)));
+        controls.addView(buttonColumn(logBtn, settingsBtn), new LinearLayout.LayoutParams(0, WRAP, 1f));
         LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(MATCH, WRAP);
-        clp.topMargin = dp(8);
-        clp.bottomMargin = dp(8);
+        clp.topMargin = dp(10);
+        clp.bottomMargin = dp(Ps2Ui.theme.light ? 22 : 6);
         page.addView(controls, clp);
         return page;
     }
 
-    private FrameLayout roundButton(int iconType) {
-        FrameLayout f = new FrameLayout(this);
-        f.setBackground(Ps2Ui.circle(0x66071033, Ps2Ui.EDGE, Math.max(1, dp(1))));
-        f.setClickable(true);
-        IconView icon = new IconView(this, iconType);
-        int p = dp(15);
-        icon.setPadding(p, p, p, p);
-        f.addView(icon, new FrameLayout.LayoutParams(MATCH, MATCH));
-        f.setTag(icon);
-        f.setLayoutParams(new FrameLayout.LayoutParams(dp(56), dp(56)));
-        return f;
+    /** Under the picture: last photo or video, zoom slider, and the photo self-timer. */
+    private View buildToolsRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        thumb = new ImageView(this);
+        thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        thumb.setBackground(Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 6));
+        thumb.setPadding(dp(3), dp(3), dp(3), dp(3));
+        thumb.setImageBitmap(lastThumb);
+        thumb.setOnClickListener(v -> openLast());
+        row.addView(thumb, new LinearLayout.LayoutParams(dp(50), dp(50)));
+
+        LinearLayout zoomCol = new LinearLayout(this);
+        zoomCol.setOrientation(LinearLayout.VERTICAL);
+        zoomLabel = Ps2Ui.text(this, "", 11, Ps2Ui.DIM, true);
+        zoomLabel.setLetterSpacing(0.08f);
+        zoomCol.addView(zoomLabel);
+        zoomBar = new SeekBar(this);
+        zoomBar.setMax(300);
+        zoomBar.setProgress(Math.round((look.zoom - 1f) * 100));
+        zoomBar.setProgressTintList(ColorStateList.valueOf(Ps2Ui.CYAN));
+        zoomBar.setThumbTintList(ColorStateList.valueOf(Ps2Ui.WHITE));
+        zoomBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                if (fromUser) setZoom(1f + p / 100f, false);
+            }
+            @Override public void onStartTrackingTouch(SeekBar s) { }
+            @Override public void onStopTrackingTouch(SeekBar s) { }
+        });
+        zoomCol.addView(zoomBar, new LinearLayout.LayoutParams(MATCH, WRAP));
+        LinearLayout.LayoutParams zl = new LinearLayout.LayoutParams(0, WRAP, 1f);
+        zl.leftMargin = dp(12);
+        zl.rightMargin = dp(12);
+        row.addView(zoomCol, zl);
+        updateZoomLabel();
+
+        timerChip = Ps2Ui.text(this, "", 12, Ps2Ui.WHITE, true);
+        timerChip.setLetterSpacing(0.06f);
+        timerChip.setGravity(Gravity.CENTER);
+        timerChip.setSingleLine(true);
+        timerChip.setPadding(dp(10), dp(8), dp(10), dp(8));
+        timerChip.setBackground(Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 8));
+        timerChip.setMinWidth(dp(86));
+        timerChip.setOnClickListener(v -> {
+            prefs.putI("timer_idx", (prefs.i("timer_idx", 0) + 1) % TIMER_S.length);
+            updateTimerChip();
+        });
+        row.addView(timerChip, new LinearLayout.LayoutParams(WRAP, WRAP));
+        updateTimerChip();
+
+        LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(MATCH, WRAP);
+        rl.topMargin = dp(12);
+        row.setLayoutParams(rl);
+        return row;
     }
 
-    private View centered(View v) {
-        FrameLayout box = new FrameLayout(this);
-        box.addView(v, new FrameLayout.LayoutParams(dp(56), dp(56), Gravity.CENTER));
-        return box;
+    private void updateTimerChip() {
+        int s = TIMER_S[prefs.i("timer_idx", 0)];
+        timerChip.setText(s == 0 ? "TIMER OFF" : "TIMER " + s + "S");
+        timerChip.setTextColor(s == 0 ? Ps2Ui.DIM : Ps2Ui.WHITE);
+    }
+
+    private void updateZoomLabel() {
+        zoomLabel.setText(String.format(Locale.US, "ZOOM %.1f\u00D7", look.zoom));
+    }
+
+    private void setZoom(float z, boolean fromPinch) {
+        z = Math.max(1f, Math.min(4f, z));
+        look.zoom = z;
+        prefs.putI("zoom_pct", Math.round(z * 100));
+        if (fromPinch) zoomBar.setProgress(Math.round((z - 1f) * 100));
+        updateZoomLabel();
+        applyLookToPreview();
+    }
+
+    /** A square button with an icon over a small label. */
+    private LinearLayout squareButton(int iconType, String label) {
+        LinearLayout b = new LinearLayout(this);
+        b.setOrientation(LinearLayout.VERTICAL);
+        b.setGravity(Gravity.CENTER);
+        b.setClickable(true);
+        b.setPadding(dp(4), dp(8), dp(4), dp(6));
+        b.setBackground(buttonBg(false));
+        IconView icon = new IconView(this, iconType);
+        b.addView(icon, new LinearLayout.LayoutParams(dp(24), dp(24)));
+        TextView t = Ps2Ui.text(this, label, 10, Ps2Ui.WHITE, true);
+        t.setLetterSpacing(0.06f);
+        t.setSingleLine(true);
+        LinearLayout.LayoutParams tl = new LinearLayout.LayoutParams(WRAP, WRAP);
+        tl.topMargin = dp(4);
+        b.addView(t, tl);
+        b.setTag(new View[]{icon, t});
+        return b;
+    }
+
+    private View buttonColumn(View top, View bottom) {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setGravity(Gravity.CENTER_HORIZONTAL);
+        LinearLayout.LayoutParams a = new LinearLayout.LayoutParams(dp(78), dp(62));
+        a.bottomMargin = dp(10);
+        col.addView(top, a);
+        col.addView(bottom, new LinearLayout.LayoutParams(dp(78), dp(62)));
+        return col;
+    }
+
+    private android.graphics.drawable.Drawable buttonBg(boolean on) {
+        return on ? Ps2Ui.selected(this, 8) : Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 8);
+    }
+
+    private void paintButton(LinearLayout b, boolean on) {
+        b.setBackground(buttonBg(on));
+        View[] parts = (View[]) b.getTag();
+        int col = on ? Ps2Ui.SEL_TEXT : Ps2Ui.WHITE;
+        ((IconView) parts[0]).setColor(col);
+        ((TextView) parts[1]).setTextColor(col);
+    }
+
+    /** Updates the date, time and free storage shown on the picture. */
+    private final Runnable hudTick = new Runnable() {
+        @Override
+        public void run() {
+            if (hudClock == null) return;
+            Date now = new Date();
+            hudClock.setText(new SimpleDateFormat("MMM dd yyyy", Locale.US).format(now).toUpperCase(Locale.US)
+                    + "\n" + new SimpleDateFormat("hh:mm a", Locale.US).format(now));
+            hudStore.setText(String.format(Locale.US, "▮ %.1f GB", freeBytes() / 1073741824.0));
+            ui.removeCallbacks(this);
+            ui.postDelayed(this, 5000);
+        }
+    };
+
+    private void updateHudMode() {
+        if (hudMode == null) return;
+        String m = Prefs.MODE_PHOTO.equals(mode) ? "PHOTO" : Prefs.MODE_TIMELAPSE.equals(mode) ? "TIME-LAPSE" : "VIDEO";
+        hudMode.setText(m + "\n640×480\n" + hudLive);
     }
 
     private View buildSettingsPage() {
@@ -401,6 +639,29 @@ public class MainActivity extends Activity {
     private void fillSettings() {
         settingsList.removeAllViews();
 
+        // ---- look ----
+        LinearLayout lookBox = Ps2Ui.section(this, settingsList, "Look");
+        lookBox.addView(Ps2Ui.toggleRow(this, "Details on screen",
+                "Mode, size, frame rate, date, time and free space over the picture. Turn off for a clearer frame.",
+                prefs.b("hud_screen", true), on -> {
+                    prefs.putB("hud_screen", on);
+                    setHudVisible(streaming);
+                }));
+        lookBox.addView(Ps2Ui.toggleRow(this, "Details on video",
+                "Burns size, frame rate, camera name, date and time into the video itself. Applies to the next recording.",
+                prefs.b("hud_video", false), on -> prefs.putB("hud_video", on)));
+        lookBox.addView(Ps2Ui.segmentRow(this, "Style", "Changes colours and buttons only. Everything works the same.",
+                Theme.NAMES, Theme.index(prefs.s("theme", Theme.DEFAULT)), i -> {
+                    if (Theme.IDS[i].equals(prefs.s("theme", Theme.DEFAULT))) return;
+                    if (isRecording() || countingDown || saveOverlay.isShowing()) {
+                        Toast.makeText(this, "Stop recording first, then change the style.", Toast.LENGTH_SHORT).show();
+                        ui.post(this::fillSettings);
+                        return;
+                    }
+                    prefs.putS("theme", Theme.IDS[i]);
+                    ui.post(this::rebuildUi);
+                }));
+
         // ---- camera name ----
         LinearLayout nameBox = Ps2Ui.section(this, settingsList, "Camera name");
         TextView nameHint = Ps2Ui.text(this,
@@ -416,7 +677,7 @@ public class MainActivity extends Activity {
             TextView ch = Ps2Ui.text(this, n, 13, Ps2Ui.WHITE, true);
             ch.setGravity(Gravity.CENTER);
             ch.setPadding(0, dp(9), 0, dp(9));
-            ch.setBackground(Ps2Ui.panel(this, 0x40000000, Ps2Ui.EDGE, 8));
+            ch.setBackground(Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 8));
             ch.setOnClickListener(v -> nameField.setText(n));
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, WRAP, 1f);
             lp.leftMargin = dp(3);
@@ -432,7 +693,7 @@ public class MainActivity extends Activity {
         nameField.setHintTextColor(Ps2Ui.DIM);
         nameField.setHint("Custom name");
         nameField.setTextSize(15);
-        nameField.setBackground(Ps2Ui.panel(this, 0x40000000, Ps2Ui.EDGE, 8));
+        nameField.setBackground(Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 8));
         nameField.setPadding(dp(12), dp(10), dp(12), dp(10));
         nameField.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
@@ -459,16 +720,15 @@ public class MainActivity extends Activity {
                 }));
         vid.addView(Ps2Ui.toggleRow(this, "Record sound", "Uses the EyeToy's built-in microphone.",
                 prefs.b("sound", true), on -> prefs.putB("sound", on)));
+        vid.addView(Ps2Ui.segmentRow(this, "Start a new file every",
+                "Splits long videos into parts so one problem never loses everything. There can be a gap of about a second between parts.",
+                SPLIT_NAMES, prefs.i("split_idx", 0), i -> prefs.putI("split_idx", i)));
 
         // ---- picture ----
         LinearLayout pic = Ps2Ui.section(this, settingsList, "Picture");
         pic.addView(buildBrightnessRow());
         pic.addView(Ps2Ui.toggleRow(this, "Mirror", "Flip left and right, like a selfie.", look.mirror, this::setMirror));
-        pic.addView(Ps2Ui.toggleRow(this, "Flip upside down", null, look.flip, on -> {
-            look.flip = on;
-            prefs.putB("flip", on);
-            applyLookToPreview();
-        }));
+        pic.addView(Ps2Ui.toggleRow(this, "Flip upside down", null, look.flip, this::setFlip));
 
         // ---- indicators ----
         LinearLayout ind = Ps2Ui.section(this, settingsList, "Recording lights");
@@ -519,7 +779,7 @@ public class MainActivity extends Activity {
         disc.setLetterSpacing(0.1f);
         disc.setGravity(Gravity.CENTER);
         disc.setPadding(0, dp(11), 0, dp(11));
-        disc.setBackground(Ps2Ui.panel(this, 0x40000000, Ps2Ui.EDGE, 8));
+        disc.setBackground(Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 8));
         disc.setOnClickListener(v -> worker.execute(this::stopAll));
         LinearLayout.LayoutParams dl = new LinearLayout.LayoutParams(MATCH, WRAP);
         dl.topMargin = dp(10);
@@ -573,17 +833,17 @@ public class MainActivity extends Activity {
         page.setOrientation(LinearLayout.VERTICAL);
         page.setPadding(0, dp(10), 0, 0);
 
-        statusView = Ps2Ui.text(this, "Not connected", 12, Ps2Ui.CYAN, false);
+        statusView = Ps2Ui.text(this, lastStatus, 12, Ps2Ui.CYAN, false);
         page.addView(statusView);
 
         logScroll = new ScrollView(this);
         logView = new TextView(this);
-        logView.setTextColor(0xFFD5E2F5);
+        logView.setTextColor(Ps2Ui.LOG_TEXT);
         logView.setTextSize(12);
         logView.setTypeface(android.graphics.Typeface.MONOSPACE);
         logView.setTextIsSelectable(true);
         logScroll.addView(logView);
-        logScroll.setBackground(Ps2Ui.panel(this, PANEL_DARK, Ps2Ui.EDGE, 8));
+        logScroll.setBackground(Ps2Ui.panel(this, Ps2Ui.LOG_BG, Ps2Ui.EDGE, 8));
         logView.setPadding(dp(10), dp(8), dp(10), dp(8));
         LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(MATCH, 0, 1f);
         llp.topMargin = dp(8);
@@ -609,14 +869,12 @@ public class MainActivity extends Activity {
         return page;
     }
 
-    private static final int PANEL_DARK = 0xB0030A22;
-
     private TextView logButton(String s) {
         TextView t = Ps2Ui.text(this, s, 13, Ps2Ui.WHITE, true);
         t.setLetterSpacing(0.1f);
         t.setGravity(Gravity.CENTER);
         t.setPadding(0, dp(11), 0, dp(11));
-        t.setBackground(Ps2Ui.panel(this, 0x40000000, Ps2Ui.EDGE, 8));
+        t.setBackground(Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 8));
         return t;
     }
 
@@ -628,20 +886,42 @@ public class MainActivity extends Activity {
         for (int i = 0; i < 3; i++) {
             pages[i].setVisibility(i == p ? View.VISIBLE : View.GONE);
             boolean on = i == p;
-            tabs[i].setTextColor(on ? Ps2Ui.WHITE : Ps2Ui.DIM);
-            tabs[i].setBackground(on ? Ps2Ui.panel(this, 0x552F6BFF, Ps2Ui.CYAN, 18) : null);
-            if (on) Ps2Ui.glow(tabs[i], 0x806FB5FF); else tabs[i].setShadowLayer(0, 0, 0, 0);
+            int col = on ? Ps2Ui.SEL_TEXT : Ps2Ui.DIM;
+            tabs[i].setTextColor(col);
+            tabIcons[i].setColor(col);
+            tabBoxes[i].setBackground(on ? Ps2Ui.selected(this, 18) : Ps2Ui.idle(this, 8));
+            if (on && !Ps2Ui.theme.light) Ps2Ui.glow(tabs[i], 0x806FB5FF); else tabs[i].setShadowLayer(0, 0, 0, 0);
         }
         if (p == PAGE_SETTINGS) fillSettings();
         if (p == PAGE_LOG) logScroll.post(() -> logScroll.fullScroll(ScrollView.FOCUS_DOWN));
     }
 
+    /** Rebuilds the whole screen in the newly chosen style, keeping the camera running. */
+    private void rebuildUi() {
+        int page = currentPage;
+        currentPage = -1;
+        ui.removeCallbacks(hudTick);
+        ui.removeCallbacks(recBlink);
+        buildUi();
+        applyLookToPreview();
+        updateModeUi();
+        logView.setText(logText);
+        if (streaming) onCameraLive(); else onCameraGone();
+        showPage(page < 0 ? PAGE_CAMERA : page);
+    }
+
     private void applyLookToPreview() {
-        preview.setScaleX(look.mirror ? -1f : 1f);
-        preview.setScaleY(look.flip ? -1f : 1f);
+        preview.setScaleX((look.mirror ? -1f : 1f) * look.zoom);
+        preview.setScaleY((look.flip ? -1f : 1f) * look.zoom);
         preview.setColorFilter(look.filter());
-        mirrorBtn.setBackground(Ps2Ui.circle(look.mirror ? Ps2Ui.SEL : 0x66071033,
-                look.mirror ? Ps2Ui.CYAN : Ps2Ui.EDGE, Math.max(1, dp(1))));
+        paintButton(mirrorBtn, look.mirror);
+        paintButton(flipBtn, look.flip);
+    }
+
+    private void setFlip(boolean on) {
+        look.flip = on;
+        prefs.putB("flip", on);
+        applyLookToPreview();
     }
 
     private void setMirror(boolean on) {
@@ -667,9 +947,11 @@ public class MainActivity extends Activity {
         String[] ids = {Prefs.MODE_VIDEO, Prefs.MODE_PHOTO, Prefs.MODE_TIMELAPSE};
         for (int i = 0; i < 3; i++) {
             boolean on = ids[i].equals(mode);
-            modeTabs[i].setTextColor(on ? Ps2Ui.WHITE : Ps2Ui.DIM);
-            modeTabs[i].setBackground(on ? Ps2Ui.panel(this, 0x552F6BFF, Ps2Ui.CYAN, 18) : null);
+            modeTabs[i].setTextColor(on ? Ps2Ui.SEL_TEXT : Ps2Ui.DIM);
+            modeTabs[i].setBackground(on ? Ps2Ui.selected(this, 18) : null);
         }
+        updateHudMode();
+        timerChip.setVisibility(Prefs.MODE_PHOTO.equals(mode) ? View.VISIBLE : View.INVISIBLE);
         shutter.setState(Prefs.MODE_PHOTO.equals(mode), isRecording());
     }
 
@@ -698,6 +980,7 @@ public class MainActivity extends Activity {
 
     private void onCameraLive() {
         noCamera.setVisibility(View.GONE);
+        setHudVisible(true);
         waveRing.setActive(prefs.b("wave", true));
         if (currentPage == PAGE_SETTINGS) fillSettings();
     }
@@ -706,11 +989,23 @@ public class MainActivity extends Activity {
         noCamera.setVisibility(View.VISIBLE);
         preview.setImageDrawable(null);
         waveRing.setActive(false);
-        chip.setText("");
+        hudLive = "";
+        setHudVisible(false);
         recBox.setVisibility(View.GONE);
         endCountdown();
         background.setAnimated(true);
         if (currentPage == PAGE_SETTINGS) fillSettings();
+    }
+
+    private void setHudVisible(boolean on) {
+        on = on && prefs.b("hud_screen", true);
+        int v = on ? View.VISIBLE : View.GONE;
+        hudMode.setVisibility(v);
+        hudClock.setVisibility(v);
+        hudStore.setVisibility(v);
+        brackets.setVisibility(v);
+        ui.removeCallbacks(hudTick);
+        if (on) hudTick.run();
     }
 
     private void flash() {
@@ -732,7 +1027,10 @@ public class MainActivity extends Activity {
     }
 
     private void status(String s) {
-        ui.post(() -> statusView.setText(s));
+        ui.post(() -> {
+            lastStatus = s;
+            statusView.setText(s);
+        });
     }
 
     private void copyLog() {
@@ -994,7 +1292,13 @@ public class MainActivity extends Activity {
                 recText = String.format(Locale.US, "TIME-LAPSE · %d frames · %.1f s", n, n / (double) TL_OUT_FPS);
             } else {
                 long sec = rec.elapsedMs() / 1000;
-                recText = String.format(Locale.US, "%d:%02d", sec / 60, sec % 60);
+                recText = String.format(Locale.US, "%s%d:%02d", recPart > 1 ? "PART " + recPart + " \u00B7 " : "",
+                        sec / 60, sec % 60);
+                int splitMin = SPLIT_MIN[prefs.i("split_idx", 0)];
+                if (splitMin > 0 && !rotating && rec.elapsedMs() >= splitMin * 60_000L) {
+                    rotating = true;
+                    worker.execute(this::rotateRecording);
+                }
             }
             if (freeBytes() < MIN_FREE_BYTES) {
                 log("Storage is almost full, so the recording is being saved and stopped.");
@@ -1002,10 +1306,11 @@ public class MainActivity extends Activity {
             }
         }
         final String label = currentLabel();
-        final String chipText = String.format(Locale.US, "● LIVE · %d fps · %s", fps, label.toUpperCase(Locale.US));
+        final String live = String.format(Locale.US, "%d FPS · %s", fps, label.toUpperCase(Locale.US));
         final String rt = recText;
         ui.post(() -> {
-            chip.setText(chipText);
+            hudLive = live;
+            updateHudMode();
             if (rt != null) recSub.setText(rt);
         });
         status(String.format(Locale.US,
@@ -1040,8 +1345,10 @@ public class MainActivity extends Activity {
             for (int i = 0; i < WaveDetector.GX; i++) {
                 float u = WaveDetector.ZX0 + (i + 0.5f) / WaveDetector.GX * (WaveDetector.ZX1 - WaveDetector.ZX0);
                 float v = WaveDetector.ZY0 + (j + 0.5f) / WaveDetector.GY * (WaveDetector.ZY1 - WaveDetector.ZY0);
-                int x = (int) ((mirror ? 1f - u : u) * (w - 1));
-                int y = (int) ((flip ? 1f - v : v) * (h - 1));
+                // with zoom, the ring covers a smaller part of the camera's picture
+                float uu = 0.5f + (u - 0.5f) / look.zoom, vv = 0.5f + (v - 0.5f) / look.zoom;
+                int x = (int) ((mirror ? 1f - uu : uu) * (w - 1));
+                int y = (int) ((flip ? 1f - vv : vv) * (h - 1));
                 zoneBuf[idx++] = luma(bmp.getPixel(x, y));
             }
         }
@@ -1077,6 +1384,17 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Connect the camera first.", Toast.LENGTH_SHORT).show();
             return;
         }
+        int t = TIMER_S[prefs.i("timer_idx", 0)];
+        if (Prefs.MODE_PHOTO.equals(mode) && t > 0 && !countingDown) {
+            log("Photo in " + t + " seconds.");
+            startCountdown(t, this::doShutter);
+            return;
+        }
+        doShutter();
+    }
+
+    /** Runs on the UI thread. Takes the photo or starts/stops the recording now. */
+    private void doShutter() {
         if (Prefs.MODE_PHOTO.equals(mode)) worker.execute(this::takePhoto);
         else toggleRecord();
     }
@@ -1088,14 +1406,14 @@ public class MainActivity extends Activity {
             fireShutter();
         } else {
             log("Wave detected: starting in 3 seconds.");
-            startCountdown();
+            startCountdown(3, this::doShutter);
         }
     }
 
-    private void startCountdown() {
+    private void startCountdown(int seconds, Runnable then) {
         countingDown = true;
         countdownView.setVisibility(View.VISIBLE);
-        final int[] n = {3};
+        final int[] n = {seconds};
         ui.post(new Runnable() {
             @Override
             public void run() {
@@ -1108,7 +1426,7 @@ public class MainActivity extends Activity {
                     ui.postDelayed(this, 1000);
                 } else {
                     endCountdown();
-                    fireShutter();
+                    then.run();
                 }
             }
         });
@@ -1168,6 +1486,7 @@ public class MainActivity extends Activity {
             done.put(MediaStore.Images.Media.IS_PENDING, 0);
             cr.update(u, done, null, null);
             log("Saved photo to Pictures/EyeToyCam/" + base + ".jpg");
+            setLast(u, false);
             ui.post(() -> saveOverlay.showDone("Pictures / EyeToyCam"));
         } catch (Exception e) {
             log("Saving failed: " + e.getMessage());
@@ -1188,7 +1507,7 @@ public class MainActivity extends Activity {
 
     /** Runs on the UI thread. */
     private void toggleRecord() {
-        if (isRecording()) {
+        if (isRecording() || rotating) {
             worker.execute(this::stopRecording);
             return;
         }
@@ -1198,9 +1517,20 @@ public class MainActivity extends Activity {
         }
         final boolean tl = Prefs.MODE_TIMELAPSE.equals(mode);
         final boolean wantSound = !tl && prefs.b("sound", true);
+        pendingSound = wantSound;
+        java.util.ArrayList<String> need = new java.util.ArrayList<>();
         if (wantSound && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             log("Asking for microphone permission (for sound)...");
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+            need.add(Manifest.permission.RECORD_AUDIO);
+        }
+        // lets the "recording" notice show; recording works without it
+        if (Build.VERSION.SDK_INT >= 33 && !prefs.b("asked_notif", false)
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            prefs.putB("asked_notif", true);
+            need.add(Manifest.permission.POST_NOTIFICATIONS);
+        }
+        if (!need.isEmpty()) {
+            requestPermissions(need.toArray(new String[0]), 1);
             return;
         }
         worker.execute(() -> startRecording(wantSound));
@@ -1210,9 +1540,10 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
         if (requestCode != 1) return;
-        final boolean ok = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
-        if (!ok) log("No microphone permission, so recording without sound.");
-        if (streaming) worker.execute(() -> startRecording(ok));
+        final boolean mic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        if (pendingSound && !mic) log("No microphone permission, so recording without sound.");
+        final boolean snd = pendingSound && mic;
+        if (streaming) worker.execute(() -> startRecording(snd));
     }
 
     /** Runs on the worker thread. */
@@ -1223,6 +1554,22 @@ public class MainActivity extends Activity {
             ui.post(() -> Toast.makeText(this, "Not enough free storage.", Toast.LENGTH_LONG).show());
             return;
         }
+        lastWithSound = withSound;
+        recPart = 1;
+        Recorder r = openRecorder(withSound);
+        if (r == null) return;
+        recorder = r;
+        RecordService.start(this);
+        startLedBlink();
+        final boolean tl = r.isTimelapse();
+        ui.post(() -> {
+            recSub.setText(tl ? "TIME-LAPSE" : "0:00");
+            updateRecUi(true);
+        });
+    }
+
+    /** Opens a new video file and starts it recording. Returns null (and logs why) if it can't. */
+    private Recorder openRecorder(boolean withSound) {
         boolean tl = Prefs.MODE_TIMELAPSE.equals(mode);
         String label = currentLabel();
         String base = Metadata.baseName(label, stamp());
@@ -1230,18 +1577,42 @@ public class MainActivity extends Activity {
         String desc = Metadata.description(label, sensorName, 640, 480, fps, tl);
         Recorder r = new Recorder(this::log);
         try {
-            r.start(this, 640, 480, fps, withSound, look, base, desc, tl, TL_OUT_FPS);
+            r.start(this, 640, 480, fps, withSound, look, base, desc, tl, TL_OUT_FPS,
+                    prefs.b("hud_video", false), label);
             lastTlMs = 0;
-            recorder = r;
-            startLedBlink();
-            ui.post(() -> {
-                recSub.setText(tl ? "TIME-LAPSE" : "0:00");
-                updateRecUi(true);
-            });
+            return r;
         } catch (Exception e) {
             log("Couldn't start recording: " + e.getMessage());
             Log.e(TAG, "startRecording", e);
             r.stop();
+            return null;
+        }
+    }
+
+    /** Runs on the worker thread. Finishes this part and carries straight on into a new file. */
+    private void rotateRecording() {
+        try {
+            Recorder old = recorder;
+            if (old == null || !old.isRunning()) return;
+            recorder = null;
+            old.stop();
+            Uri saved = old.savedUri();
+            if (saved != null) setLast(saved, true);
+            Recorder next = (streaming && freeBytes() >= MIN_FREE_BYTES) ? openRecorder(lastWithSound) : null;
+            if (next == null) {
+                log("Couldn't carry on into a new file, so the recording has ended.");
+                stopLedBlink();
+                RecordService.stop(this);
+                ui.post(() -> {
+                    updateRecUi(false);
+                    saveOverlay.showDone("Movies / EyeToyCam");
+                });
+                return;
+            }
+            recPart++;
+            recorder = next;
+        } finally {
+            rotating = false;
         }
     }
 
@@ -1256,11 +1627,53 @@ public class MainActivity extends Activity {
             updateRecUi(false);
         });
         r.stop();
+        RecordService.stop(this);
         final String name = r.savedName();
+        if (r.savedUri() != null) setLast(r.savedUri(), true);
         ui.post(() -> {
             if (name != null) saveOverlay.showDone("Movies / EyeToyCam");
             else saveOverlay.showFail("The recording had no pictures.");
         });
+    }
+
+    // ------------------------------------------------------------------ last photo / video
+
+    /** Remembers the newest saved photo or video and shows its thumbnail. Any thread. */
+    private void setLast(Uri u, boolean video) {
+        lastUri = u;
+        lastIsVideo = video;
+        prefs.putS("last_uri", u.toString());
+        prefs.putB("last_video", video);
+        loadThumb(u);
+    }
+
+    /** Builds the thumbnail (do this off the UI thread) and puts it on screen. */
+    private void loadThumb(Uri u) {
+        Bitmap b = null;
+        try {
+            b = getContentResolver().loadThumbnail(u, new Size(200, 200), null);
+        } catch (Exception ignored) { }
+        final Bitmap bb = b;
+        ui.post(() -> {
+            lastThumb = bb;
+            if (thumb != null) thumb.setImageBitmap(bb);
+        });
+    }
+
+    private void openLast() {
+        Uri u = lastUri;
+        if (u == null || lastThumb == null) {
+            Toast.makeText(this, "Nothing saved yet.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Intent i = new Intent(Intent.ACTION_VIEW)
+                .setDataAndType(u, lastIsVideo ? "video/mp4" : "image/jpeg")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivity(i);
+        } catch (Exception e) {
+            Toast.makeText(this, "No app found to open it.", Toast.LENGTH_SHORT).show();
+        }
     }
 
     // ------------------------------------------------------------------ camera light

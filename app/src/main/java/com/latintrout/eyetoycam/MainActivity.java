@@ -35,6 +35,8 @@ import android.provider.MediaStore;
 import android.text.Editable;
 import android.text.TextWatcher;
 import android.util.Log;
+import android.util.Size;
+import android.view.ScaleGestureDetector;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -64,6 +66,9 @@ public class MainActivity extends Activity {
     private static final int[] TL_SECONDS = {1, 2, 5, 10, 30, 60};
     private static final String[] TL_NAMES = {"1 s", "2 s", "5 s", "10 s", "30 s", "1 min"};
     private static final int TL_OUT_FPS = 30;
+    private static final int[] TIMER_S = {0, 3, 5, 10};
+    private static final String[] SPLIT_NAMES = {"Off", "5 min", "10 min", "30 min"};
+    private static final int[] SPLIT_MIN = {0, 5, 10, 30};
     private static final long MIN_FREE_BYTES = 300L * 1024 * 1024;
     private static final int PAGE_CAMERA = 0, PAGE_SETTINGS = 1, PAGE_LOG = 2;
     private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT;
@@ -125,6 +130,16 @@ public class MainActivity extends Activity {
     private ShutterView shutter;
     private final TextView[] modeTabs = new TextView[3];
     private LinearLayout mirrorBtn, flipBtn;
+    private ImageView thumb;
+    private Bitmap lastThumb;
+    private TextView timerChip, zoomLabel;
+    private SeekBar zoomBar;
+    private ScaleGestureDetector pinch;
+    private volatile Uri lastUri;
+    private volatile boolean lastIsVideo;
+    private volatile boolean rotating;
+    private volatile boolean lastWithSound, pendingSound;
+    private volatile int recPart = 1;
     private SaveOverlay saveOverlay;
     private TextView logView, statusView;
     private ScrollView logScroll;
@@ -141,12 +156,22 @@ public class MainActivity extends Activity {
         look.mirror = prefs.b("mirror", false);
         look.flip = prefs.b("flip", false);
         look.setBrightness(prefs.i("brightness", 0));
+        look.zoom = Math.max(1f, Math.min(4f, prefs.i("zoom_pct", 100) / 100f));
+        String lu = prefs.s("last_uri", "");
+        if (!lu.isEmpty()) {
+            lastUri = Uri.parse(lu);
+            lastIsVideo = prefs.b("last_video", false);
+        }
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
         buildUi();
         applyLookToPreview();
         updateModeUi();
         showPage(PAGE_CAMERA);
+        if (lastUri != null) {
+            final Uri u = lastUri;
+            worker.execute(() -> loadThumb(u));
+        }
 
         IntentFilter f = new IntentFilter();
         f.addAction(ACTION_PERMISSION);
@@ -330,6 +355,18 @@ public class MainActivity extends Activity {
         noCamera.addView(connectBtn, cbl);
         screen.addView(noCamera, new FrameLayout.LayoutParams(MATCH, MATCH));
 
+        pinch = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override
+            public boolean onScale(ScaleGestureDetector d) {
+                setZoom(look.zoom * d.getScaleFactor(), true);
+                return true;
+            }
+        });
+        screen.setOnTouchListener((v, e) -> {
+            pinch.onTouchEvent(e);
+            return true;
+        });
+
         brackets = new FocusBrackets(this);
         brackets.setVisibility(View.GONE);
         screen.addView(brackets, new FrameLayout.LayoutParams(MATCH, MATCH));
@@ -395,6 +432,7 @@ public class MainActivity extends Activity {
         screen.addView(flashView, new FrameLayout.LayoutParams(MATCH, MATCH));
 
         page.addView(previewFrame, new LinearLayout.LayoutParams(MATCH, WRAP));
+        page.addView(buildToolsRow());
         page.addView(spacer(1f));
 
         // ---- mode selector ----
@@ -445,6 +483,83 @@ public class MainActivity extends Activity {
         clp.bottomMargin = dp(Ps2Ui.theme.light ? 22 : 6);
         page.addView(controls, clp);
         return page;
+    }
+
+    /** Under the picture: last photo or video, zoom slider, and the photo self-timer. */
+    private View buildToolsRow() {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        thumb = new ImageView(this);
+        thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        thumb.setBackground(Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 6));
+        thumb.setPadding(dp(3), dp(3), dp(3), dp(3));
+        thumb.setImageBitmap(lastThumb);
+        thumb.setOnClickListener(v -> openLast());
+        row.addView(thumb, new LinearLayout.LayoutParams(dp(50), dp(50)));
+
+        LinearLayout zoomCol = new LinearLayout(this);
+        zoomCol.setOrientation(LinearLayout.VERTICAL);
+        zoomLabel = Ps2Ui.text(this, "", 11, Ps2Ui.DIM, true);
+        zoomLabel.setLetterSpacing(0.08f);
+        zoomCol.addView(zoomLabel);
+        zoomBar = new SeekBar(this);
+        zoomBar.setMax(300);
+        zoomBar.setProgress(Math.round((look.zoom - 1f) * 100));
+        zoomBar.setProgressTintList(ColorStateList.valueOf(Ps2Ui.CYAN));
+        zoomBar.setThumbTintList(ColorStateList.valueOf(Ps2Ui.WHITE));
+        zoomBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                if (fromUser) setZoom(1f + p / 100f, false);
+            }
+            @Override public void onStartTrackingTouch(SeekBar s) { }
+            @Override public void onStopTrackingTouch(SeekBar s) { }
+        });
+        zoomCol.addView(zoomBar, new LinearLayout.LayoutParams(MATCH, WRAP));
+        LinearLayout.LayoutParams zl = new LinearLayout.LayoutParams(0, WRAP, 1f);
+        zl.leftMargin = dp(12);
+        zl.rightMargin = dp(12);
+        row.addView(zoomCol, zl);
+        updateZoomLabel();
+
+        timerChip = Ps2Ui.text(this, "", 12, Ps2Ui.WHITE, true);
+        timerChip.setLetterSpacing(0.06f);
+        timerChip.setGravity(Gravity.CENTER);
+        timerChip.setSingleLine(true);
+        timerChip.setPadding(dp(10), dp(8), dp(10), dp(8));
+        timerChip.setBackground(Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 8));
+        timerChip.setMinWidth(dp(86));
+        timerChip.setOnClickListener(v -> {
+            prefs.putI("timer_idx", (prefs.i("timer_idx", 0) + 1) % TIMER_S.length);
+            updateTimerChip();
+        });
+        row.addView(timerChip, new LinearLayout.LayoutParams(WRAP, WRAP));
+        updateTimerChip();
+
+        LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(MATCH, WRAP);
+        rl.topMargin = dp(12);
+        row.setLayoutParams(rl);
+        return row;
+    }
+
+    private void updateTimerChip() {
+        int s = TIMER_S[prefs.i("timer_idx", 0)];
+        timerChip.setText(s == 0 ? "TIMER OFF" : "TIMER " + s + "S");
+        timerChip.setTextColor(s == 0 ? Ps2Ui.DIM : Ps2Ui.WHITE);
+    }
+
+    private void updateZoomLabel() {
+        zoomLabel.setText(String.format(Locale.US, "ZOOM %.1f\u00D7", look.zoom));
+    }
+
+    private void setZoom(float z, boolean fromPinch) {
+        z = Math.max(1f, Math.min(4f, z));
+        look.zoom = z;
+        prefs.putI("zoom_pct", Math.round(z * 100));
+        if (fromPinch) zoomBar.setProgress(Math.round((z - 1f) * 100));
+        updateZoomLabel();
+        applyLookToPreview();
     }
 
     /** A square button with an icon over a small label. */
@@ -605,6 +720,9 @@ public class MainActivity extends Activity {
                 }));
         vid.addView(Ps2Ui.toggleRow(this, "Record sound", "Uses the EyeToy's built-in microphone.",
                 prefs.b("sound", true), on -> prefs.putB("sound", on)));
+        vid.addView(Ps2Ui.segmentRow(this, "Start a new file every",
+                "Splits long videos into parts so one problem never loses everything. There can be a gap of about a second between parts.",
+                SPLIT_NAMES, prefs.i("split_idx", 0), i -> prefs.putI("split_idx", i)));
 
         // ---- picture ----
         LinearLayout pic = Ps2Ui.section(this, settingsList, "Picture");
@@ -793,8 +911,8 @@ public class MainActivity extends Activity {
     }
 
     private void applyLookToPreview() {
-        preview.setScaleX(look.mirror ? -1f : 1f);
-        preview.setScaleY(look.flip ? -1f : 1f);
+        preview.setScaleX((look.mirror ? -1f : 1f) * look.zoom);
+        preview.setScaleY((look.flip ? -1f : 1f) * look.zoom);
         preview.setColorFilter(look.filter());
         paintButton(mirrorBtn, look.mirror);
         paintButton(flipBtn, look.flip);
@@ -833,6 +951,7 @@ public class MainActivity extends Activity {
             modeTabs[i].setBackground(on ? Ps2Ui.selected(this, 18) : null);
         }
         updateHudMode();
+        timerChip.setVisibility(Prefs.MODE_PHOTO.equals(mode) ? View.VISIBLE : View.INVISIBLE);
         shutter.setState(Prefs.MODE_PHOTO.equals(mode), isRecording());
     }
 
@@ -1173,7 +1292,13 @@ public class MainActivity extends Activity {
                 recText = String.format(Locale.US, "TIME-LAPSE · %d frames · %.1f s", n, n / (double) TL_OUT_FPS);
             } else {
                 long sec = rec.elapsedMs() / 1000;
-                recText = String.format(Locale.US, "%d:%02d", sec / 60, sec % 60);
+                recText = String.format(Locale.US, "%s%d:%02d", recPart > 1 ? "PART " + recPart + " \u00B7 " : "",
+                        sec / 60, sec % 60);
+                int splitMin = SPLIT_MIN[prefs.i("split_idx", 0)];
+                if (splitMin > 0 && !rotating && rec.elapsedMs() >= splitMin * 60_000L) {
+                    rotating = true;
+                    worker.execute(this::rotateRecording);
+                }
             }
             if (freeBytes() < MIN_FREE_BYTES) {
                 log("Storage is almost full, so the recording is being saved and stopped.");
@@ -1220,8 +1345,10 @@ public class MainActivity extends Activity {
             for (int i = 0; i < WaveDetector.GX; i++) {
                 float u = WaveDetector.ZX0 + (i + 0.5f) / WaveDetector.GX * (WaveDetector.ZX1 - WaveDetector.ZX0);
                 float v = WaveDetector.ZY0 + (j + 0.5f) / WaveDetector.GY * (WaveDetector.ZY1 - WaveDetector.ZY0);
-                int x = (int) ((mirror ? 1f - u : u) * (w - 1));
-                int y = (int) ((flip ? 1f - v : v) * (h - 1));
+                // with zoom, the ring covers a smaller part of the camera's picture
+                float uu = 0.5f + (u - 0.5f) / look.zoom, vv = 0.5f + (v - 0.5f) / look.zoom;
+                int x = (int) ((mirror ? 1f - uu : uu) * (w - 1));
+                int y = (int) ((flip ? 1f - vv : vv) * (h - 1));
                 zoneBuf[idx++] = luma(bmp.getPixel(x, y));
             }
         }
@@ -1257,6 +1384,17 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Connect the camera first.", Toast.LENGTH_SHORT).show();
             return;
         }
+        int t = TIMER_S[prefs.i("timer_idx", 0)];
+        if (Prefs.MODE_PHOTO.equals(mode) && t > 0 && !countingDown) {
+            log("Photo in " + t + " seconds.");
+            startCountdown(t, this::doShutter);
+            return;
+        }
+        doShutter();
+    }
+
+    /** Runs on the UI thread. Takes the photo or starts/stops the recording now. */
+    private void doShutter() {
         if (Prefs.MODE_PHOTO.equals(mode)) worker.execute(this::takePhoto);
         else toggleRecord();
     }
@@ -1268,14 +1406,14 @@ public class MainActivity extends Activity {
             fireShutter();
         } else {
             log("Wave detected: starting in 3 seconds.");
-            startCountdown();
+            startCountdown(3, this::doShutter);
         }
     }
 
-    private void startCountdown() {
+    private void startCountdown(int seconds, Runnable then) {
         countingDown = true;
         countdownView.setVisibility(View.VISIBLE);
-        final int[] n = {3};
+        final int[] n = {seconds};
         ui.post(new Runnable() {
             @Override
             public void run() {
@@ -1288,7 +1426,7 @@ public class MainActivity extends Activity {
                     ui.postDelayed(this, 1000);
                 } else {
                     endCountdown();
-                    fireShutter();
+                    then.run();
                 }
             }
         });
@@ -1348,6 +1486,7 @@ public class MainActivity extends Activity {
             done.put(MediaStore.Images.Media.IS_PENDING, 0);
             cr.update(u, done, null, null);
             log("Saved photo to Pictures/EyeToyCam/" + base + ".jpg");
+            setLast(u, false);
             ui.post(() -> saveOverlay.showDone("Pictures / EyeToyCam"));
         } catch (Exception e) {
             log("Saving failed: " + e.getMessage());
@@ -1368,7 +1507,7 @@ public class MainActivity extends Activity {
 
     /** Runs on the UI thread. */
     private void toggleRecord() {
-        if (isRecording()) {
+        if (isRecording() || rotating) {
             worker.execute(this::stopRecording);
             return;
         }
@@ -1378,9 +1517,20 @@ public class MainActivity extends Activity {
         }
         final boolean tl = Prefs.MODE_TIMELAPSE.equals(mode);
         final boolean wantSound = !tl && prefs.b("sound", true);
+        pendingSound = wantSound;
+        java.util.ArrayList<String> need = new java.util.ArrayList<>();
         if (wantSound && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             log("Asking for microphone permission (for sound)...");
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1);
+            need.add(Manifest.permission.RECORD_AUDIO);
+        }
+        // lets the "recording" notice show; recording works without it
+        if (Build.VERSION.SDK_INT >= 33 && !prefs.b("asked_notif", false)
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            prefs.putB("asked_notif", true);
+            need.add(Manifest.permission.POST_NOTIFICATIONS);
+        }
+        if (!need.isEmpty()) {
+            requestPermissions(need.toArray(new String[0]), 1);
             return;
         }
         worker.execute(() -> startRecording(wantSound));
@@ -1390,9 +1540,10 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
         if (requestCode != 1) return;
-        final boolean ok = results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED;
-        if (!ok) log("No microphone permission, so recording without sound.");
-        if (streaming) worker.execute(() -> startRecording(ok));
+        final boolean mic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+        if (pendingSound && !mic) log("No microphone permission, so recording without sound.");
+        final boolean snd = pendingSound && mic;
+        if (streaming) worker.execute(() -> startRecording(snd));
     }
 
     /** Runs on the worker thread. */
@@ -1403,6 +1554,22 @@ public class MainActivity extends Activity {
             ui.post(() -> Toast.makeText(this, "Not enough free storage.", Toast.LENGTH_LONG).show());
             return;
         }
+        lastWithSound = withSound;
+        recPart = 1;
+        Recorder r = openRecorder(withSound);
+        if (r == null) return;
+        recorder = r;
+        RecordService.start(this);
+        startLedBlink();
+        final boolean tl = r.isTimelapse();
+        ui.post(() -> {
+            recSub.setText(tl ? "TIME-LAPSE" : "0:00");
+            updateRecUi(true);
+        });
+    }
+
+    /** Opens a new video file and starts it recording. Returns null (and logs why) if it can't. */
+    private Recorder openRecorder(boolean withSound) {
         boolean tl = Prefs.MODE_TIMELAPSE.equals(mode);
         String label = currentLabel();
         String base = Metadata.baseName(label, stamp());
@@ -1413,16 +1580,39 @@ public class MainActivity extends Activity {
             r.start(this, 640, 480, fps, withSound, look, base, desc, tl, TL_OUT_FPS,
                     prefs.b("hud_video", false), label);
             lastTlMs = 0;
-            recorder = r;
-            startLedBlink();
-            ui.post(() -> {
-                recSub.setText(tl ? "TIME-LAPSE" : "0:00");
-                updateRecUi(true);
-            });
+            return r;
         } catch (Exception e) {
             log("Couldn't start recording: " + e.getMessage());
             Log.e(TAG, "startRecording", e);
             r.stop();
+            return null;
+        }
+    }
+
+    /** Runs on the worker thread. Finishes this part and carries straight on into a new file. */
+    private void rotateRecording() {
+        try {
+            Recorder old = recorder;
+            if (old == null || !old.isRunning()) return;
+            recorder = null;
+            old.stop();
+            Uri saved = old.savedUri();
+            if (saved != null) setLast(saved, true);
+            Recorder next = (streaming && freeBytes() >= MIN_FREE_BYTES) ? openRecorder(lastWithSound) : null;
+            if (next == null) {
+                log("Couldn't carry on into a new file, so the recording has ended.");
+                stopLedBlink();
+                RecordService.stop(this);
+                ui.post(() -> {
+                    updateRecUi(false);
+                    saveOverlay.showDone("Movies / EyeToyCam");
+                });
+                return;
+            }
+            recPart++;
+            recorder = next;
+        } finally {
+            rotating = false;
         }
     }
 
@@ -1437,11 +1627,53 @@ public class MainActivity extends Activity {
             updateRecUi(false);
         });
         r.stop();
+        RecordService.stop(this);
         final String name = r.savedName();
+        if (r.savedUri() != null) setLast(r.savedUri(), true);
         ui.post(() -> {
             if (name != null) saveOverlay.showDone("Movies / EyeToyCam");
             else saveOverlay.showFail("The recording had no pictures.");
         });
+    }
+
+    // ------------------------------------------------------------------ last photo / video
+
+    /** Remembers the newest saved photo or video and shows its thumbnail. Any thread. */
+    private void setLast(Uri u, boolean video) {
+        lastUri = u;
+        lastIsVideo = video;
+        prefs.putS("last_uri", u.toString());
+        prefs.putB("last_video", video);
+        loadThumb(u);
+    }
+
+    /** Builds the thumbnail (do this off the UI thread) and puts it on screen. */
+    private void loadThumb(Uri u) {
+        Bitmap b = null;
+        try {
+            b = getContentResolver().loadThumbnail(u, new Size(200, 200), null);
+        } catch (Exception ignored) { }
+        final Bitmap bb = b;
+        ui.post(() -> {
+            lastThumb = bb;
+            if (thumb != null) thumb.setImageBitmap(bb);
+        });
+    }
+
+    private void openLast() {
+        Uri u = lastUri;
+        if (u == null || lastThumb == null) {
+            Toast.makeText(this, "Nothing saved yet.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        Intent i = new Intent(Intent.ACTION_VIEW)
+                .setDataAndType(u, lastIsVideo ? "video/mp4" : "image/jpeg")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivity(i);
+        } catch (Exception e) {
+            Toast.makeText(this, "No app found to open it.", Toast.LENGTH_SHORT).show();
+        }
     }
 
     // ------------------------------------------------------------------ camera light

@@ -85,6 +85,8 @@ final class Recorder {
     long elapsedMs() { return running ? (System.nanoTime() - startNs) / 1_000_000 : 0; }
     /** File name if the video was saved successfully, otherwise null. */
     String savedName() { return saved ? fileName : null; }
+    /** Where the video was saved, or null if it wasn't. */
+    Uri savedUri() { return saved ? uri : null; }
 
     void start(Context ctx, int w, int h, int fps, boolean wantAudio, Look lk, String baseName,
                String description, boolean tl, int timelapseFps,
@@ -208,7 +210,8 @@ final class Recorder {
             try {
                 c.drawColor(Color.BLACK);
                 c.save();
-                c.scale(look.mirror ? -1f : 1f, look.flip ? -1f : 1f, width / 2f, height / 2f);
+                float z = look.zoom;
+                c.scale((look.mirror ? -1f : 1f) * z, (look.flip ? -1f : 1f) * z, width / 2f, height / 2f);
                 paint.setColorFilter(look.filter());
                 c.drawBitmap(bmp, null, dst, paint);
                 c.restore();

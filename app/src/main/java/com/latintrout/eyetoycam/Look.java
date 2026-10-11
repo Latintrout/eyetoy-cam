@@ -12,6 +12,8 @@ import android.graphics.Paint;
  */
 final class Look {
     volatile boolean mirror, flip;
+    /** Digital zoom, 1.0 to 4.0, about the middle of the picture. */
+    volatile float zoom = 1f;
     private volatile int brightness;          // 0..100
     private ColorMatrixColorFilter cached;
     private int cachedFor = -1;
@@ -45,7 +47,7 @@ final class Look {
         Paint p = new Paint(Paint.FILTER_BITMAP_FLAG);
         p.setColorFilter(filter());
         c.save();
-        c.scale(mirror ? -1f : 1f, flip ? -1f : 1f, w / 2f, h / 2f);
+        c.scale((mirror ? -1f : 1f) * zoom, (flip ? -1f : 1f) * zoom, w / 2f, h / 2f);
         c.drawBitmap(src, 0, 0, p);
         c.restore();
         return out;

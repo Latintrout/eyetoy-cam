@@ -44,7 +44,9 @@ final class Recorder {
     private final Logger log;
     private final Object muxLock = new Object();
     private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
-    private final Rect dst = new Rect();
+    private final android.graphics.RectF dstF = new android.graphics.RectF();
+    /** Microphone loudness of the last chunk, 0 (silent) to 1 (very loud). */
+    private volatile float micLevel;
 
     private MediaCodec venc, aenc;
     private Surface inSurface;
@@ -96,7 +98,7 @@ final class Recorder {
         look = lk;
         timelapse = tl;
         outFps = timelapseFps;
-        dst.set(0, 0, w, h);
+        dstF.set(0, 0, w, h);
         burn = burnDetails;
         if (burn) {
             // size, frame rate and camera name, top-left; date and time, bottom-left
@@ -213,8 +215,11 @@ final class Recorder {
                 float z = look.zoom;
                 c.scale((look.mirror ? -1f : 1f) * z, (look.flip ? -1f : 1f) * z, width / 2f, height / 2f);
                 paint.setColorFilter(look.filter());
-                c.drawBitmap(bmp, null, dst, paint);
+                int fx = look.effect;
+                long t = System.currentTimeMillis();
+                Effects.drawPicture(c, bmp, dstF, paint, fx, t);
                 c.restore();
+                Effects.drawOverlay(c, width, height, fx, t);
                 if (burn) drawDetails(c);
             } finally {
                 inSurface.unlockCanvasAndPost(c);
@@ -355,6 +360,22 @@ final class Recorder {
         }
     }
 
+    /** Mic loudness for the level meter, 0 to 1 (about -50 dB to 0 dB). */
+    float micLevel() { return withAudio ? micLevel : -1f; }
+
+    private static float level(byte[] pcm, int n) {
+        long sum = 0;
+        int count = n / 2;
+        for (int i = 0; i + 1 < n; i += 2) {
+            int v = (short) ((pcm[i] & 0xff) | (pcm[i + 1] << 8));
+            sum += (long) v * v;
+        }
+        if (count == 0) return 0f;
+        double rms = Math.sqrt(sum / (double) count) / 32768.0;
+        double db = 20 * Math.log10(Math.max(rms, 1e-6));
+        return (float) Math.max(0, Math.min(1, (db + 50) / 50));
+    }
+
     private void audioLoop() {
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         byte[] pcm = new byte[4096];
@@ -363,6 +384,7 @@ final class Recorder {
         while (running) {
             int n = audio.read(pcm, 0, pcm.length);
             if (n <= 0) continue;
+            micLevel = level(pcm, n);
             long nowUs = (System.nanoTime() - startNs) / 1000;
             if (audioStartUs < 0) audioStartUs = Math.max(0, nowUs - n / 2 * 1_000_000L / SAMPLE_RATE);
             // timestamps from the sample count keep the audio smooth and in step with the clock

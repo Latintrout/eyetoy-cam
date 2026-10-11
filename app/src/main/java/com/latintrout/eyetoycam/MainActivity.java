@@ -136,7 +136,8 @@ public class MainActivity extends Activity {
     private LinearLayout mirrorBtn, flipBtn;
     private ImageView thumb;
     private Bitmap lastThumb;
-    private TextView timerChip, zoomLabel;
+    private TextView timerChip, zoomLabel, fxChip;
+    private LevelMeter micMeter;
     private SeekBar zoomBar;
     private ScaleGestureDetector pinch;
     private volatile Uri lastUri;
@@ -160,6 +161,7 @@ public class MainActivity extends Activity {
         look.mirror = prefs.b("mirror", false);
         look.flip = prefs.b("flip", false);
         look.setBrightness(prefs.i("brightness", 0));
+        look.effect = Math.max(0, Math.min(Effects.NAMES.length - 1, prefs.i("effect", Effects.OFF)));
         look.zoom = Math.max(1f, Math.min(4f, prefs.i("zoom_pct", 100) / 100f));
         String lu = prefs.s("last_uri", "");
         if (!lu.isEmpty()) {
@@ -431,6 +433,11 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams rsl = new LinearLayout.LayoutParams(WRAP, WRAP);
         rsl.leftMargin = dp(8);
         recBox.addView(recSub, rsl);
+        micMeter = new LevelMeter(this);
+        micMeter.setVisibility(View.GONE);
+        LinearLayout.LayoutParams mml = new LinearLayout.LayoutParams(dp(64), dp(10));
+        mml.leftMargin = dp(10);
+        recBox.addView(micMeter, mml);
         recBox.setVisibility(View.GONE);
         LinearLayout.LayoutParams rbl = new LinearLayout.LayoutParams(WRAP, WRAP);
         rbl.bottomMargin = dp(6);
@@ -575,10 +582,37 @@ public class MainActivity extends Activity {
         row.addView(timerChip, new LinearLayout.LayoutParams(WRAP, WRAP));
         updateTimerChip();
 
+        // retro effect: tap to step through them
+        fxChip = Ps2Ui.text(this, "", 12, Ps2Ui.WHITE, true);
+        fxChip.setLetterSpacing(0.06f);
+        fxChip.setGravity(Gravity.CENTER);
+        fxChip.setSingleLine(true);
+        fxChip.setPadding(dp(10), dp(8), dp(10), dp(8));
+        fxChip.setBackground(Ps2Ui.panel(this, Ps2Ui.IDLE, Ps2Ui.EDGE, 8));
+        fxChip.setMinWidth(dp(86));
+        fxChip.setOnClickListener(v -> setEffect((look.effect + 1) % Effects.NAMES.length));
+        LinearLayout.LayoutParams fl = new LinearLayout.LayoutParams(WRAP, WRAP);
+        fl.leftMargin = dp(6);
+        row.addView(fxChip, fl);
+        updateFxChip();
+
         LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(MATCH, WRAP);
         rl.topMargin = dp(12);
         row.setLayoutParams(rl);
         return row;
+    }
+
+    private void updateFxChip() {
+        fxChip.setText("FX " + Effects.NAMES[look.effect]);
+        fxChip.setTextColor(look.effect == Effects.OFF ? Ps2Ui.DIM : Ps2Ui.WHITE);
+    }
+
+    /** Picks a retro effect for the live picture, photos and video (works mid-recording too). */
+    private void setEffect(int e) {
+        look.effect = e;
+        prefs.putI("effect", e);
+        updateFxChip();
+        applyLookToPreview();
     }
 
     private void updateTimerChip() {
@@ -1213,7 +1247,7 @@ public class MainActivity extends Activity {
             modeTabs[i].setBackground(on ? Ps2Ui.selected(this, 18) : null);
         }
         updateHudMode();
-        timerChip.setVisibility(Prefs.MODE_PHOTO.equals(mode) ? View.VISIBLE : View.INVISIBLE);
+        timerChip.setVisibility(Prefs.MODE_PHOTO.equals(mode) ? View.VISIBLE : View.GONE);
         shutter.setState(Prefs.MODE_PHOTO.equals(mode), isRecording());
     }
 
@@ -1225,7 +1259,27 @@ public class MainActivity extends Activity {
         background.setAnimated(!recording);
         ui.removeCallbacks(recBlink);
         if (recording && prefs.b("blink_dot", false)) ui.postDelayed(recBlink, 600);
+        ui.removeCallbacks(micTick);
+        micMeter.setVisibility(View.GONE);
+        if (recording) micTick.run();
     }
+
+    /** Moves the mic level meter while a recording with sound runs. */
+    private final Runnable micTick = new Runnable() {
+        @Override
+        public void run() {
+            Recorder r = recorder;
+            if (r == null || !r.isRunning()) {
+                micMeter.setVisibility(View.GONE);
+                if (rotating) ui.postDelayed(this, 200);   // between two parts of a split recording
+                return;
+            }
+            float l = r.micLevel();
+            micMeter.setVisibility(l < 0 ? View.GONE : View.VISIBLE);
+            if (l >= 0) micMeter.setLevel(l);
+            ui.postDelayed(this, 80);
+        }
+    };
 
     private final Runnable recBlink = new Runnable() {
         @Override
@@ -1549,7 +1603,7 @@ public class MainActivity extends Activity {
                         }
                         if (prefs.b("wave", true) && !saveOverlay.isShowing() && !countingDown) detectWave(bmp, now);
                     }
-                    final Bitmap show = bmp;
+                    final Bitmap show = Effects.render(bmp, look.effect, now);
                     ui.post(() -> {
                         if (c.view != null) c.view.setImageBitmap(show);
                     });

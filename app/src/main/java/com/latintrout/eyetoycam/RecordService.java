@@ -23,16 +23,30 @@ public final class RecordService extends Service {
     private static final int ID = 1;
     private PowerManager.WakeLock wake;
 
+    /** What keeps the service running: a recording, the Wi-Fi webcam, or both. */
+    private static volatile boolean recording, wifi;
+
     /** Call when a recording starts. Never throws; recording works without the service. */
     static void start(Context c) {
-        try {
-            c.startForegroundService(new Intent(c, RecordService.class));
-        } catch (Exception ignored) { }
+        recording = true;
+        refresh(c);
     }
 
     static void stop(Context c) {
+        recording = false;
+        refresh(c);
+    }
+
+    /** Call when the Wi-Fi webcam turns on or off. */
+    static void setWifi(Context c, boolean on) {
+        wifi = on;
+        refresh(c);
+    }
+
+    private static void refresh(Context c) {
         try {
-            c.stopService(new Intent(c, RecordService.class));
+            if (recording || wifi) c.startForegroundService(new Intent(c, RecordService.class));
+            else c.stopService(new Intent(c, RecordService.class));
         } catch (Exception ignored) { }
     }
 
@@ -45,8 +59,10 @@ public final class RecordService extends Service {
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         Notification n = new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_menu_camera)
-                .setContentTitle("EyeToy Cam is recording")
-                .setContentText("Tap to open. Stop the recording in the app.")
+                .setContentTitle(recording && wifi ? "EyeToy Cam is recording and streaming"
+                        : recording ? "EyeToy Cam is recording" : "EyeToy Cam Wi-Fi webcam is on")
+                .setContentText(recording ? "Tap to open. Stop the recording in the app."
+                        : "Tap to open. Turn it off in the app.")
                 .setContentIntent(open)
                 .setOngoing(true)
                 .build();

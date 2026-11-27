@@ -173,6 +173,7 @@ final class Recorder {
 
     @SuppressWarnings("MissingPermission")
     private void startAudio(Context ctx) throws Exception {
+        WifiServer.micBusy = true;   // the Wi-Fi webcam lets go of the mic and gets our sound instead
         int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
         if (minBuf <= 0) throw new Exception("audio not available");
         audio = new AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
@@ -385,6 +386,7 @@ final class Recorder {
             int n = audio.read(pcm, 0, pcm.length);
             if (n <= 0) continue;
             micLevel = level(pcm, n);
+            WifiServer.feedPcm(pcm, n);
             long nowUs = (System.nanoTime() - startNs) / 1000;
             if (audioStartUs < 0) audioStartUs = Math.max(0, nowUs - n / 2 * 1_000_000L / SAMPLE_RATE);
             // timestamps from the sample count keep the audio smooth and in step with the clock
@@ -467,6 +469,7 @@ final class Recorder {
             audio.release();
             audio = null;
         }
+        WifiServer.micBusy = false;
         if (aenc != null) {
             try { aenc.stop(); } catch (Exception ignored) { }
             aenc.release();

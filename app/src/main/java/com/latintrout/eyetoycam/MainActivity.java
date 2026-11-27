@@ -149,6 +149,10 @@ public class MainActivity extends Activity {
     private TextView logView, statusView;
     private ScrollView logScroll;
     private LinearLayout settingsList;
+    private TextView wifiBadge;
+
+    // ---- Wi-Fi webcam ----
+    private WifiServer wifi;
 
     // ------------------------------------------------------------------ lifecycle
 
@@ -169,6 +173,17 @@ public class MainActivity extends Activity {
             lastIsVideo = prefs.b("last_video", false);
         }
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        wifi = new WifiServer(this, new WifiServer.Cams() {
+            @Override public Cam main() { return main; }
+            @Override public Cam cam(int n) {
+                if (n < 1 || n > cams.length) return null;
+                synchronized (cams) { return cams[n - 1]; }
+            }
+            @Override public String label(int n) {
+                Cam c = cam(n);
+                return c == null ? "" : prefs.s("label_" + c.key(), "EyeToy");
+            }
+        }, this::log);
 
         buildUi();
         applyLookToPreview();
@@ -218,6 +233,11 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        ui.removeCallbacks(wifiTick);
+        if (wifi.isRunning()) {
+            wifi.stop();
+            RecordService.setWifi(this, false);
+        }
         try { unregisterReceiver(usbReceiver); } catch (Exception ignored) { }
         try { getSystemService(PowerManager.class).removeThermalStatusListener(thermalListener); } catch (Exception ignored) { }
         worker.execute(this::stopAll);
@@ -412,6 +432,18 @@ public class MainActivity extends Activity {
 
         waveRing = new WaveRing(this);
         screen.addView(waveRing, new FrameLayout.LayoutParams(MATCH, MATCH));
+
+        // ---- bottom centre: Wi-Fi webcam on/off and its address ----
+        wifiBadge = Ps2Ui.hud(this, "", 11, Ps2Ui.HUD);
+        wifiBadge.setGravity(Gravity.CENTER);
+        wifiBadge.setLineSpacing(0, 1.1f);
+        wifiBadge.setPadding(dp(10), dp(5), dp(10), dp(5));
+        wifiBadge.setClickable(true);
+        wifiBadge.setOnClickListener(v -> setWifiOn(!wifi.isRunning()));
+        FrameLayout.LayoutParams wbl = new FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        wbl.bottomMargin = dp(10);
+        screen.addView(wifiBadge, wbl);
+        updateWifiBadge();
 
         // ---- top-left: REC indicator, then mode / size / live info ----
         LinearLayout topLeft = new LinearLayout(this);
@@ -799,6 +831,22 @@ public class MainActivity extends Activity {
                         else restartCamera();
                     }
                 }));
+
+        // ---- Wi-Fi webcam ----
+        LinearLayout wf = Ps2Ui.section(this, settingsList, "Wi-Fi webcam");
+        wf.addView(Ps2Ui.toggleRow(this, "Stream to a PC over Wi-Fi",
+                "Sends the camera picture to OBS or a web browser on the same Wi-Fi. You can also tap WI-FI at the bottom of the picture.",
+                wifi.isRunning(), this::setWifiOn));
+        wf.addView(Ps2Ui.toggleRow(this, "Send sound", "The EyeToy's microphone, as a separate sound stream.",
+                prefs.b("wifi_sound", true), on -> {
+                    prefs.putB("wifi_sound", on);
+                    wifi.setSound(on);
+                    if (on && wifi.isRunning()) askMicForWifi();
+                }));
+        TextView wfInfo = Ps2Ui.text(this, wifiHelp(), 12, Ps2Ui.DIM, false);
+        wfInfo.setLineSpacing(0, 1.15f);
+        wfInfo.setTextIsSelectable(true);
+        wf.addView(wfInfo);
 
         // ---- video ----
         LinearLayout vid = Ps2Ui.section(this, settingsList, "Video");
@@ -1322,6 +1370,7 @@ public class MainActivity extends Activity {
         brackets.setVisibility(v);
         ui.removeCallbacks(hudTick);
         if (on) hudTick.run();
+        updateWifiBadge();
     }
 
     private void flash() {
@@ -1918,6 +1967,11 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode == 2) {
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+                log("No microphone permission, so the Wi-Fi webcam sends no sound.");
+            return;
+        }
         if (requestCode != 1) return;
         final boolean mic = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
         if (pendingSound && !mic) log("No microphone permission, so recording without sound.");
@@ -2118,6 +2172,108 @@ public class MainActivity extends Activity {
                 if (currentPage == PAGE_SETTINGS) fillSettings();
             });
         }
+    }
+
+    // ------------------------------------------------------------------ Wi-Fi webcam
+
+    /** Turns the Wi-Fi webcam on or off. UI thread. */
+    private void setWifiOn(boolean on) {
+        if (on == wifi.isRunning()) {
+            fillSettingsIfShown();
+            return;
+        }
+        if (on) {
+            if (WifiServer.ipAddress() == null) {
+                Toast.makeText(this, "Join a Wi-Fi network first (the PC must be on the same one).", Toast.LENGTH_LONG).show();
+                log("Wi-Fi webcam: the phone isn't on a Wi-Fi network.");
+                fillSettingsIfShown();
+                return;
+            }
+            boolean snd = prefs.b("wifi_sound", true);
+            if (!wifi.start(snd)) {
+                Toast.makeText(this, "Couldn't start the Wi-Fi webcam. See the Log tab.", Toast.LENGTH_LONG).show();
+                fillSettingsIfShown();
+                return;
+            }
+            RecordService.setWifi(this, true);
+            if (snd) askMicForWifi();
+            String url = wifi.baseUrl();
+            if (url != null) log("On the PC, open " + url + " in a browser, or in OBS add a Browser source with "
+                    + url + "/view and a Media source with " + url + "/audio.");
+            if (!streaming) log("Wi-Fi webcam is on but no camera is connected yet.");
+            wifiTick.run();
+        } else {
+            ui.removeCallbacks(wifiTick);
+            wifi.stop();
+            RecordService.setWifi(this, false);
+        }
+        updateWifiBadge();
+        fillSettingsIfShown();
+    }
+
+    private void fillSettingsIfShown() {
+        if (currentPage == PAGE_SETTINGS) ui.post(this::fillSettings);
+    }
+
+    private void askMicForWifi() {
+        java.util.ArrayList<String> need = new java.util.ArrayList<>();
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            log("Asking for microphone permission (for Wi-Fi sound)...");
+            need.add(Manifest.permission.RECORD_AUDIO);
+        }
+        if (Build.VERSION.SDK_INT >= 33 && !prefs.b("asked_notif", false)
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            prefs.putB("asked_notif", true);
+            need.add(Manifest.permission.POST_NOTIFICATIONS);
+        }
+        if (!need.isEmpty()) requestPermissions(need.toArray(new String[0]), 2);
+    }
+
+    /** Keeps the on-screen address and viewer count up to date while streaming. */
+    private final Runnable wifiTick = new Runnable() {
+        @Override
+        public void run() {
+            updateWifiBadge();
+            ui.removeCallbacks(this);
+            if (wifi.isRunning()) ui.postDelayed(this, 2000);
+        }
+    };
+
+    private void updateWifiBadge() {
+        if (wifiBadge == null) return;
+        if (!wifi.isRunning()) {
+            wifiBadge.setText("WI-FI OFF");
+            wifiBadge.setTextColor(Ps2Ui.HUD_DIM);
+            wifiBadge.setBackground(Ps2Ui.panel(this, 0x66000000, 0x66FFFFFF, 12));
+            wifiBadge.setVisibility(streaming && prefs.b("hud_screen", true) ? View.VISIBLE : View.GONE);
+            return;
+        }
+        String url = wifi.baseUrl();
+        int v = wifi.videoViewers();
+        String who = v == 0 ? "waiting for PC" : v == 1 ? "1 watching" : v + " watching";
+        wifiBadge.setText("WI-FI ON · " + who + "\n" + (url == null ? "no Wi-Fi network" : url.replace("http://", "")));
+        wifiBadge.setTextColor(Ps2Ui.HUD);
+        wifiBadge.setBackground(Ps2Ui.panel(this, 0xAA0B3D2A, 0xFF3DDC84, 12));
+        wifiBadge.setVisibility(View.VISIBLE);
+    }
+
+    /** Plain-English instructions with this phone's real addresses. */
+    private String wifiHelp() {
+        String url = wifi.isRunning() ? wifi.baseUrl() : null;
+        String base = url != null ? url : "http://<phone address>:" + WifiServer.PORT;
+        StringBuilder sb = new StringBuilder();
+        if (url == null) sb.append("Turn it on to see this phone's address. The PC must be on the same Wi-Fi.\n\n");
+        sb.append("Quick check: open ").append(base).append(" in a web browser on the PC.\n\n");
+        sb.append("OBS picture: Sources + > Browser. URL ").append(base).append("/view, width 640, height 480.\n");
+        java.util.List<Cam> list = camList();
+        if (list.size() > 1) {
+            for (Cam c : list) sb.append("  CAM ").append(c.number()).append(": ").append(base).append("/view").append(c.number()).append("\n");
+            sb.append("  (/view on its own follows the main camera.)\n");
+        }
+        sb.append("\nOBS sound: Sources + > Media Source. Untick Local File, Input ").append(base)
+                .append("/audio, set Network Buffering to 0 MB.\n\n");
+        sb.append("The picture is the camera's own, so Mirror, Flip, Zoom and FX aren't applied to it. Keep the app open on the Camera tab while streaming.");
+        return sb.toString();
     }
 
     /** Safe to call any time, from the worker thread. */

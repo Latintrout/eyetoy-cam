@@ -5,3 +5,5 @@ app/.cxx/
 local.properties
 *.iml
 .idea/
+windows/out/
+windows/third_party/

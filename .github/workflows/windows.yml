@@ -1,0 +1,50 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main, 'claude/**']
+    paths:
+      - 'windows/**'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64
+        run: sudo apt-get update -q && sudo apt-get install -y -q g++-mingw-w64-x86-64 p7zip-full
+
+      - name: Get libusb for Windows
+        run: |
+          curl -sSL -o libusb.7z https://github.com/libusb/libusb/releases/download/v1.0.27/libusb-1.0.27.7z
+          7z x -owindows/third_party/libusb libusb.7z > /dev/null
+
+      - name: Build
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -o pipefail
+          sh windows/build.sh 2>&1 | tee windows-build.log
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp windows/out/EyeToyCam.exe dist/EyeToyCam.exe
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-build-${{ github.run_number }}
+          name: EyeToy Cam for Windows, build ${{ github.run_number }}
+          body: |
+            Download EyeToyCam.exe and double-click it. No install needed.
+            Built from ${{ github.ref_name }} (${{ github.sha }}).
+          files: dist/EyeToyCam.exe
+          prerelease: ${{ github.ref_name != 'main' }}
+          make_latest: false

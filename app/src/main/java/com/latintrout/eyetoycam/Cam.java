@@ -38,6 +38,10 @@ final class Cam {
     volatile boolean live;
     /** Newest picture that decoded, for photos. */
     volatile byte[] lastJpeg;
+    /** Newest decoded picture, for the combined (grid / picture-in-picture) video. */
+    volatile android.graphics.Bitmap lastBmp;
+    /** When this camera last added a time-lapse frame. */
+    volatile long lastTlMs;
 
     // on-screen tile (UI thread only)
     FrameLayout tile;

@@ -3,80 +3,92 @@ package com.latintrout.eyetoycam;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
-import android.graphics.Rect;
-import android.media.AudioDeviceInfo;
-import android.media.AudioFormat;
-import android.media.AudioManager;
-import android.media.AudioRecord;
+import android.graphics.RectF;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
-import android.media.MediaMuxer;
-import android.media.MediaRecorder;
 import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.MediaStore;
+import android.system.Os;
 import android.view.Surface;
 
+import java.io.FileDescriptor;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
 
 /**
  * Records the EyeToy picture to an MP4 in Movies/EyeToyCam.
  *
- * Normal mode: H.264 video + AAC sound, frames timed by the real clock.
- * Time-lapse mode: no sound; every frame handed in becomes one frame of a
- * fixed-speed video, however long it was since the last one.
+ * The file is a fragmented MP4 (see {@link Fmp4Writer}): it is written in pieces
+ * of about a second, so a crash or a killed app loses at most the last second or
+ * two, and {@link #recoverUnfinished} rescues such files the next time the app opens.
+ *
+ * Normal mode: H.264 video + AAC sound (from a shared {@link MicSource}), frames
+ * timed by the real clock. Time-lapse mode: no sound; every frame handed in becomes
+ * one frame of a fixed-speed video, however long it was since the last one.
+ * A recorder can also draw several cameras into one picture (grid or picture-in-picture).
  */
-final class Recorder {
+final class Recorder implements MicSource.Listener {
 
     interface Logger { void log(String msg); }
 
-    private static final int SAMPLE_RATE = 44100;
+    /** Video files being written right now, so the rescue never touches one in use. */
+    private static final Set<String> ACTIVE = Collections.synchronizedSet(new HashSet<>());
 
     private final Logger log;
-    private final Object muxLock = new Object();
     private final Paint paint = new Paint(Paint.FILTER_BITMAP_FLAG);
-    private final android.graphics.RectF dstF = new android.graphics.RectF();
-    /** Microphone loudness of the last chunk, 0 (silent) to 1 (very loud). */
-    private volatile float micLevel;
+    private final RectF dstF = new RectF();
+    private final RectF cell = new RectF();
 
     private MediaCodec venc, aenc;
     private Surface inSurface;
-    private MediaMuxer muxer;
+    private Fmp4Writer writer;
     private ParcelFileDescriptor pfd;
     private ContentResolver cr;
     private Uri uri;
     private String fileName;
-    private AudioRecord audio;
-    private Thread videoThread, audioThread;
+    private MicSource mic;
+    private Thread videoThread;
+    private final Object audioLock = new Object();
     private Look look;
     private boolean burn;
     private String burnLine1 = "", burnLine2 = "";
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textShadow = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint smallText = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint smallShadow = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint frameEdge = new Paint();
     private final SimpleDateFormat dateFmt = new SimpleDateFormat("MMM dd yyyy", Locale.US);
     private final SimpleDateFormat timeFmt = new SimpleDateFormat("hh:mm:ss a", Locale.US);
     private long burnSecond = -1;
     private String burnDate = "", burnTime = "";
 
-    private int vTrack = -1, aTrack = -1;
-    private boolean muxStarted;
     private boolean withAudio;
     private volatile boolean running;
+    private volatile boolean writeFailed;
     private boolean timelapse;
     private int outFps = 30;
     private long startNs;
     private int width, height;
     private volatile long videoSamples;
     private volatile long framesDrawn;
+    private long audioSamples, audioStartUs = -1;
+    private boolean audioEos;
     private boolean saved;
 
     Recorder(Logger logger) { log = logger; }
@@ -89,8 +101,12 @@ final class Recorder {
     String savedName() { return saved ? fileName : null; }
     /** Where the video was saved, or null if it wasn't. */
     Uri savedUri() { return saved ? uri : null; }
+    boolean hasSound() { return withAudio; }
 
-    void start(Context ctx, int w, int h, int fps, boolean wantAudio, Look lk, String baseName,
+    /**
+     * @param mic the shared microphone, or null for no sound (time-lapse never has sound)
+     */
+    void start(Context ctx, int w, int h, int fps, MicSource mic, Look lk, String baseName,
                String description, boolean tl, int timelapseFps,
                boolean burnDetails, String cameraName) throws Exception {
         width = w;
@@ -100,11 +116,11 @@ final class Recorder {
         outFps = timelapseFps;
         dstF.set(0, 0, w, h);
         burn = burnDetails;
+        float px = Math.min(w / 640f, h / 480f);
         if (burn) {
             // size, frame rate and camera name, top-left; date and time, bottom-left
-            burnLine1 = w + "\u00D7" + h;
-            burnLine2 = (tl ? "" : fps + " FPS \u00B7 ") + cameraName.toUpperCase(Locale.US);
-            float px = h / 480f;
+            burnLine1 = w + "×" + h;
+            burnLine2 = (tl ? "" : fps + " FPS · ") + cameraName.toUpperCase(Locale.US);
             textPaint.setColor(0xFFF4F6FA);
             textPaint.setTypeface(android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE,
                     android.graphics.Typeface.BOLD));
@@ -113,6 +129,17 @@ final class Recorder {
             textShadow.setTypeface(textPaint.getTypeface());
             textShadow.setTextSize(20f * px);
         }
+        smallText.set(textPaint);
+        smallText.setColor(0xFFF4F6FA);
+        smallText.setTypeface(android.graphics.Typeface.create(android.graphics.Typeface.MONOSPACE,
+                android.graphics.Typeface.BOLD));
+        smallText.setTextSize(15f * px);
+        smallShadow.set(smallText);
+        smallShadow.setColor(0xCC000000);
+        frameEdge.setColor(0xFF000000);
+        frameEdge.setStyle(Paint.Style.STROKE);
+        frameEdge.setStrokeWidth(Math.max(2f, 3f * px));
+
         cr = ctx.getContentResolver();
         fileName = baseName + ".mp4";
 
@@ -130,30 +157,40 @@ final class Recorder {
             uri = cr.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, v);
         }
         if (uri == null) throw new Exception("couldn't create the video file");
+        ACTIVE.add(uri.toString());
         pfd = cr.openFileDescriptor(uri, "rw");
         if (pfd == null) throw new Exception("couldn't open the video file");
-        muxer = new MediaMuxer(pfd.getFileDescriptor(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+
+        withAudio = mic != null && !timelapse;
+        writer = new Fmp4Writer(new FdIo(pfd.getFileDescriptor()), withAudio);
 
         // ---- video encoder ----
+        int base = timelapse ? 4_000_000 : 2_500_000;
+        int bitrate = (int) Math.min(10_000_000L, (long) base * w * h / (640 * 480));
         MediaFormat vf = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h);
         vf.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-        vf.setInteger(MediaFormat.KEY_BIT_RATE, timelapse ? 4_000_000 : 2_500_000);
+        vf.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
         vf.setInteger(MediaFormat.KEY_FRAME_RATE, timelapse ? outFps : fps);
+        // a key frame every second: each one-second piece of the file can start with one
         vf.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
         venc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
         venc.configure(vf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
         inSurface = venc.createInputSurface();
         venc.start();
 
-        // ---- audio ----
-        withAudio = false;
-        if (wantAudio && !timelapse) {
+        // ---- sound encoder (fed by the shared mic) ----
+        if (withAudio) {
             try {
-                startAudio(ctx);
-                withAudio = true;
+                MediaFormat af = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, MicSource.SAMPLE_RATE, 1);
+                af.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
+                af.setInteger(MediaFormat.KEY_BIT_RATE, 96_000);
+                af.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384);
+                aenc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
+                aenc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                aenc.start();
             } catch (Exception e) {
-                log.log("Recording without sound: " + e.getMessage());
-                releaseAudio();
+                // can't happen after the writer was told to expect sound without breaking it, so fail the start
+                throw new Exception("sound encoder couldn't start: " + e.getMessage());
             }
         }
 
@@ -164,45 +201,14 @@ final class Recorder {
         videoThread = new Thread(this::videoLoop, "video-enc");
         videoThread.start();
         if (withAudio) {
-            audioThread = new Thread(this::audioLoop, "audio-enc");
-            audioThread.start();
+            this.mic = mic;
+            mic.add(this);
         }
         log.log((timelapse ? "Time-lapse" : "Recording") + " to Movies/EyeToyCam/" + fileName
                 + (withAudio || timelapse ? "" : " (no sound)"));
     }
 
-    @SuppressWarnings("MissingPermission")
-    private void startAudio(Context ctx) throws Exception {
-        int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
-        if (minBuf <= 0) throw new Exception("audio not available");
-        audio = new AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT, Math.max(minBuf * 4, 16384));
-        if (audio.getState() != AudioRecord.STATE_INITIALIZED) throw new Exception("microphone couldn't start");
-
-        AudioManager am = ctx.getSystemService(AudioManager.class);
-        AudioDeviceInfo usbMic = null;
-        for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_INPUTS)) {
-            if (d.getType() == AudioDeviceInfo.TYPE_USB_DEVICE || d.getType() == AudioDeviceInfo.TYPE_USB_HEADSET) {
-                usbMic = d;
-                break;
-            }
-        }
-        if (usbMic != null) {
-            audio.setPreferredDevice(usbMic);
-            log.log("Using the EyeToy's microphone (" + usbMic.getProductName() + ").");
-        } else {
-            log.log("EyeToy microphone not found by Android, using the phone's mic.");
-        }
-
-        MediaFormat af = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, SAMPLE_RATE, 1);
-        af.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
-        af.setInteger(MediaFormat.KEY_BIT_RATE, 96_000);
-        af.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384);
-        aenc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
-        aenc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-        aenc.start();
-        audio.startRecording();
-    }
+    // ------------------------------------------------------------------ drawing
 
     /** Draws one camera frame into the video. */
     void drawFrame(Bitmap bmp) {
@@ -211,15 +217,9 @@ final class Recorder {
             Canvas c = inSurface.lockHardwareCanvas();
             try {
                 c.drawColor(Color.BLACK);
-                c.save();
-                float z = look.zoom;
-                c.scale((look.mirror ? -1f : 1f) * z, (look.flip ? -1f : 1f) * z, width / 2f, height / 2f);
-                paint.setColorFilter(look.filter());
-                int fx = look.effect;
                 long t = System.currentTimeMillis();
-                Effects.drawPicture(c, bmp, dstF, paint, fx, t);
-                c.restore();
-                Effects.drawOverlay(c, width, height, fx, t);
+                drawCell(c, bmp, dstF, t);
+                Effects.drawOverlay(c, width, height, look.effect, t);
                 if (burn) drawDetails(c);
             } finally {
                 inSurface.unlockCanvasAndPost(c);
@@ -230,8 +230,81 @@ final class Recorder {
         }
     }
 
+    /**
+     * Draws several cameras into one picture. bmps[0] is the main camera.
+     * Grid: side by side for two, 2x2 for three or four. Picture-in-picture: the main
+     * camera fills the frame and the others sit small in the bottom-right corner.
+     * A null bitmap (camera not ready yet) leaves its place black.
+     */
+    void drawComposite(Bitmap[] bmps, String[] labels, boolean pip) {
+        if (!running) return;
+        try {
+            Canvas c = inSurface.lockHardwareCanvas();
+            try {
+                c.drawColor(Color.BLACK);
+                long t = System.currentTimeMillis();
+                int n = bmps.length;
+                if (pip) {
+                    if (bmps[0] != null) drawCell(c, bmps[0], dstF, t);
+                    if (burn) label(c, labels[0], dstF);
+                    float m = height / 32f, cw = width / 4f, ch = height / 4f;
+                    for (int i = 1; i < n; i++) {
+                        float right = width - m - (i - 1) * (cw + m);
+                        cell.set(right - cw, height - m - ch, right, height - m);
+                        c.drawRect(cell, frameEdge);
+                        if (bmps[i] != null) drawCell(c, bmps[i], cell, t);
+                        if (burn) label(c, labels[i], cell);
+                    }
+                } else {
+                    int cols = 2, rows = n <= 2 ? 1 : 2;
+                    float cw = width / (float) cols, ch = height / (float) rows;
+                    for (int i = 0; i < n; i++) {
+                        int col = i % cols, row = i / cols;
+                        cell.set(col * cw, row * ch, (col + 1) * cw, (row + 1) * ch);
+                        if (bmps[i] != null) drawCell(c, bmps[i], cell, t);
+                        if (burn) label(c, labels[i], cell);
+                    }
+                }
+                Effects.drawOverlay(c, width, height, look.effect, t);
+                if (burn) drawDateTime(c);
+            } finally {
+                inSurface.unlockCanvasAndPost(c);
+            }
+            framesDrawn++;
+        } catch (Exception e) {
+            // a dropped frame is not worth stopping the recording for
+        }
+    }
+
+    /** One camera picture with mirror / flip / zoom / colours / effect, kept inside dst. */
+    private void drawCell(Canvas c, Bitmap bmp, RectF dst, long t) {
+        c.save();
+        c.clipRect(dst);
+        float z = look.zoom;
+        c.scale((look.mirror ? -1f : 1f) * z, (look.flip ? -1f : 1f) * z, dst.centerX(), dst.centerY());
+        paint.setColorFilter(look.filter());
+        Effects.drawPicture(c, bmp, dst, paint, look.effect, t);
+        c.restore();
+    }
+
+    private void label(Canvas c, String s, RectF r) {
+        if (s == null || s.isEmpty()) return;
+        float m = Math.max(4f, r.height() / 24f);
+        float o = Math.max(1f, smallText.getTextSize() / 12f);
+        float y = r.top + m + smallText.getTextSize();
+        c.drawText(s, r.left + m + o, y + o, smallShadow);
+        c.drawText(s, r.left + m, y, smallText);
+    }
+
     /** The on-picture details, drawn after mirror/flip so the words never come out backwards. */
     private void drawDetails(Canvas c) {
+        float px = Math.min(width / 640f, height / 480f), m = 16f * px, line = 26f * px;
+        text(c, burnLine1, m, m + line * 0.8f);
+        text(c, burnLine2, m, m + line * 1.8f);
+        drawDateTime(c);
+    }
+
+    private void drawDateTime(Canvas c) {
         long sec = System.currentTimeMillis() / 1000;
         if (sec != burnSecond) {
             Date now = new Date();
@@ -239,9 +312,7 @@ final class Recorder {
             burnTime = timeFmt.format(now);
             burnSecond = sec;
         }
-        float px = height / 480f, m = 16f * px, line = 26f * px;
-        text(c, burnLine1, m, m + line * 0.8f);
-        text(c, burnLine2, m, m + line * 1.8f);
+        float px = Math.min(width / 640f, height / 480f), m = 16f * px, line = 26f * px;
         text(c, burnDate, m, height - m - line);
         text(c, burnTime, m, height - m);
     }
@@ -252,43 +323,11 @@ final class Recorder {
         c.drawText(s, x, y, textPaint);
     }
 
-    // ---- muxer helpers ----
-
-    private void addTrack(boolean isVideo, MediaFormat f) {
-        synchronized (muxLock) {
-            if (isVideo) vTrack = muxer.addTrack(f);
-            else aTrack = muxer.addTrack(f);
-            boolean ready = vTrack >= 0 && (!withAudio || aTrack >= 0);
-            if (ready && !muxStarted) {
-                muxer.start();
-                muxStarted = true;
-                muxLock.notifyAll();
-            }
-        }
-    }
-
-    /** Blocks until the muxer is started (or recording is stopping). */
-    private boolean waitForMuxer() {
-        synchronized (muxLock) {
-            while (!muxStarted) {
-                try { muxLock.wait(100); } catch (InterruptedException e) { return false; }
-                if (!running && !muxStarted) return false;
-            }
-            return true;
-        }
-    }
-
-    private void write(int track, ByteBuffer buf, MediaCodec.BufferInfo info) {
-        synchronized (muxLock) {
-            if (muxStarted) muxer.writeSampleData(track, buf, info);
-        }
-    }
-
-    // ---- video ----
+    // ------------------------------------------------------------------ video
 
     private void videoLoop() {
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-        boolean eosSent = false;
+        boolean eosSent = false, configured = false;
         long lastPts = -1;
         long base = Long.MIN_VALUE;
         while (true) {
@@ -299,11 +338,21 @@ final class Recorder {
             int idx;
             try { idx = venc.dequeueOutputBuffer(info, 10_000); } catch (Exception e) { break; }
             if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                addTrack(true, venc.getOutputFormat());
+                MediaFormat f = venc.getOutputFormat();
+                ByteBuffer c0 = f.getByteBuffer("csd-0"), c1 = f.getByteBuffer("csd-1");
+                if (c0 != null && c1 != null) {
+                    writer.setVideoConfig(width, height, Fmp4Writer.stripStartCode(c0), Fmp4Writer.stripStartCode(c1));
+                    configured = true;
+                }
             } else if (idx >= 0) {
                 ByteBuffer out = venc.getOutputBuffer(idx);
                 boolean config = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
-                if (!config && info.size > 0 && out != null && (muxStarted || waitForMuxer())) {
+                if (config && !configured && out != null && info.size > 0) {
+                    // some encoders only hand the SPS/PPS over as a buffer
+                    out.position(info.offset);
+                    out.limit(info.offset + info.size);
+                    configured = configFromBuffer(out);
+                } else if (!config && info.size > 0 && out != null) {
                     if (timelapse) {
                         // every frame lasts exactly 1/outFps, whatever the real gap was
                         info.presentationTimeUs = videoSamples * 1_000_000L / outFps;
@@ -320,21 +369,81 @@ final class Recorder {
                         lastPts = info.presentationTimeUs;
                         out.position(info.offset);
                         out.limit(info.offset + info.size);
-                        write(vTrack, out, info);
-                        videoSamples++;
+                        try {
+                            writer.addVideo(out, info.presentationTimeUs,
+                                    (info.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0);
+                            videoSamples++;
+                        } catch (IOException e) {
+                            writeError(e);
+                        }
                     }
                 }
                 venc.releaseOutputBuffer(idx, false);
                 if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
-            } else if (eosSent && idx == MediaCodec.INFO_TRY_AGAIN_LATER && vTrack < 0) {
+            } else if (eosSent && idx == MediaCodec.INFO_TRY_AGAIN_LATER && videoSamples == 0) {
                 break; // nothing was ever recorded
             }
         }
     }
 
-    // ---- audio ----
+    /** Reads SPS (NAL type 7) and PPS (type 8) out of an Annex B config buffer. */
+    private boolean configFromBuffer(ByteBuffer b) {
+        byte[] a = new byte[b.remaining()];
+        b.get(a);
+        byte[] sps = null, pps = null;
+        ByteBuffer lp = ByteBuffer.wrap(Fmp4Writer.toLengthPrefixed(ByteBuffer.wrap(a)));
+        while (lp.remaining() >= 4) {
+            int len = lp.getInt();
+            if (len <= 0 || len > lp.remaining()) break;
+            byte[] nal = new byte[len];
+            lp.get(nal);
+            int type = nal[0] & 0x1f;
+            if (type == 7) sps = nal;
+            else if (type == 8) pps = nal;
+        }
+        if (sps == null || pps == null) return false;
+        writer.setVideoConfig(width, height, sps, pps);
+        return true;
+    }
 
-    private void drainAudio(MediaCodec.BufferInfo info, boolean untilEos) {
+    private void writeError(IOException e) {
+        if (!writeFailed) {
+            writeFailed = true;
+            log.log("Writing the video failed: " + e.getMessage());
+        }
+    }
+
+    // ------------------------------------------------------------------ sound
+
+    /** Called on the mic thread with each chunk of sound. */
+    @Override
+    public void onPcm(byte[] pcm, int n, long capturedNs) {
+        synchronized (audioLock) {
+            if (!running || aenc == null || audioEos) return;
+            if (audioStartUs < 0) audioStartUs = Math.max(0, (capturedNs - startNs) / 1000);
+            // timestamps from the sample count keep the sound smooth and in step with the clock
+            long pts = audioStartUs + audioSamples * 1_000_000L / MicSource.SAMPLE_RATE;
+            int off = 0;
+            while (off < n) {
+                int in;
+                try { in = aenc.dequeueInputBuffer(10_000); } catch (Exception e) { return; }
+                if (in < 0) break;   // encoder is behind: drop the rest of this chunk
+                ByteBuffer b = aenc.getInputBuffer(in);
+                if (b == null) break;
+                b.clear();
+                int len = Math.min(n - off, b.remaining());
+                b.put(pcm, off, len);
+                aenc.queueInputBuffer(in, 0, len, pts, 0);
+                off += len;
+                audioSamples += len / 2;
+                pts = audioStartUs + audioSamples * 1_000_000L / MicSource.SAMPLE_RATE;
+            }
+            drainAudio(false);
+        }
+    }
+
+    private void drainAudio(boolean untilEos) {
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         int idle = 0;
         while (true) {
             int idx;
@@ -344,106 +453,95 @@ final class Recorder {
                 continue;
             }
             if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                addTrack(false, aenc.getOutputFormat());
+                MediaFormat f = aenc.getOutputFormat();
+                ByteBuffer c0 = f.getByteBuffer("csd-0");
+                if (c0 != null) {
+                    byte[] asc = new byte[c0.remaining()];
+                    c0.duplicate().get(asc);
+                    writer.setAudioConfig(f.getInteger(MediaFormat.KEY_SAMPLE_RATE),
+                            f.getInteger(MediaFormat.KEY_CHANNEL_COUNT), asc);
+                }
                 continue;
             }
             if (idx < 0) continue;
             ByteBuffer out = aenc.getOutputBuffer(idx);
             boolean config = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
-            if (!config && info.size > 0 && out != null && (muxStarted || waitForMuxer())) {
+            if (config && out != null && info.size > 0) {
+                // AudioSpecificConfig handed over as a buffer instead of in the format
+                byte[] asc = new byte[info.size];
+                out.position(info.offset);
+                out.get(asc, 0, info.size);
+                writer.setAudioConfig(MicSource.SAMPLE_RATE, 1, asc);
+            } else if (info.size > 0 && out != null) {
                 out.position(info.offset);
                 out.limit(info.offset + info.size);
-                write(aTrack, out, info);
+                try {
+                    writer.addAudio(out, info.presentationTimeUs);
+                } catch (IOException e) {
+                    writeError(e);
+                }
             }
             aenc.releaseOutputBuffer(idx, false);
             if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) return;
         }
     }
 
-    /** Mic loudness for the level meter, 0 to 1 (about -50 dB to 0 dB). */
-    float micLevel() { return withAudio ? micLevel : -1f; }
-
-    private static float level(byte[] pcm, int n) {
-        long sum = 0;
-        int count = n / 2;
-        for (int i = 0; i + 1 < n; i += 2) {
-            int v = (short) ((pcm[i] & 0xff) | (pcm[i + 1] << 8));
-            sum += (long) v * v;
-        }
-        if (count == 0) return 0f;
-        double rms = Math.sqrt(sum / (double) count) / 32768.0;
-        double db = 20 * Math.log10(Math.max(rms, 1e-6));
-        return (float) Math.max(0, Math.min(1, (db + 50) / 50));
-    }
-
-    private void audioLoop() {
-        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-        byte[] pcm = new byte[4096];
-        long samplesWritten = 0;
-        long audioStartUs = -1;
-        while (running) {
-            int n = audio.read(pcm, 0, pcm.length);
-            if (n <= 0) continue;
-            micLevel = level(pcm, n);
-            long nowUs = (System.nanoTime() - startNs) / 1000;
-            if (audioStartUs < 0) audioStartUs = Math.max(0, nowUs - n / 2 * 1_000_000L / SAMPLE_RATE);
-            // timestamps from the sample count keep the audio smooth and in step with the clock
-            long pts = audioStartUs + samplesWritten * 1_000_000L / SAMPLE_RATE;
-            int in = aenc.dequeueInputBuffer(10_000);
-            if (in >= 0) {
-                ByteBuffer b = aenc.getInputBuffer(in);
-                if (b != null) {
-                    b.clear();
-                    int len = Math.min(n, b.remaining());
-                    b.put(pcm, 0, len);
-                    aenc.queueInputBuffer(in, 0, len, pts, 0);
-                    samplesWritten += len / 2;
+    /** Sends the end of the sound through the encoder so its last bit lands in the file. */
+    private void finishAudio() {
+        synchronized (audioLock) {
+            if (aenc == null || audioEos) return;
+            audioEos = true;
+            try {
+                int in = aenc.dequeueInputBuffer(50_000);
+                if (in >= 0) {
+                    long pts = audioStartUs < 0 ? 0 : audioStartUs + audioSamples * 1_000_000L / MicSource.SAMPLE_RATE;
+                    aenc.queueInputBuffer(in, 0, 0, pts, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                    drainAudio(true);
                 }
-            }
-            drainAudio(info, false);
-        }
-        int in = aenc.dequeueInputBuffer(50_000);
-        if (in >= 0) {
-            long pts = audioStartUs < 0 ? 0 : audioStartUs + samplesWritten * 1_000_000L / SAMPLE_RATE;
-            aenc.queueInputBuffer(in, 0, 0, pts, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
-            drainAudio(info, true);
+            } catch (Exception ignored) { }
         }
     }
 
-    // ---- stop ----
+    // ------------------------------------------------------------------ stop
 
     /** Finishes the file. Safe to call more than once. */
     void stop() {
-        if (!running && muxer == null) return;
+        if (!running && writer == null) return;
         long durMs = elapsedMs();
         running = false;
-        synchronized (muxLock) { muxLock.notifyAll(); }
-        join(audioThread);
+        if (mic != null) mic.remove(this);
+        mic = null;
         join(videoThread);
-        audioThread = null;
         videoThread = null;
+        finishAudio();
 
         boolean ok = false;
         try {
-            if (muxer != null && muxStarted && videoSamples > 0) {
-                muxer.stop();
-                ok = true;
+            if (writer != null && videoSamples > 0) {
+                writer.close();
+                ok = !writeFailed || writer.fragments() > 0;
             }
         } catch (Exception e) {
             log.log("Finishing the video failed: " + e.getMessage());
+            ok = writer != null && writer.fragments() > 0;   // the pieces already written still play
         }
-        try { if (muxer != null) muxer.release(); } catch (Exception ignored) { }
-        muxer = null;
-        muxStarted = false;
-        vTrack = aTrack = -1;
+        long fragments = writer == null ? 0 : writer.fragments();
+        writer = null;
         try { if (venc != null) venc.stop(); } catch (Exception ignored) { }
         try { if (venc != null) venc.release(); } catch (Exception ignored) { }
         try { if (inSurface != null) inSurface.release(); } catch (Exception ignored) { }
         venc = null;
-        releaseAudio();
+        synchronized (audioLock) {
+            if (aenc != null) {
+                try { aenc.stop(); } catch (Exception ignored) { }
+                try { aenc.release(); } catch (Exception ignored) { }
+                aenc = null;
+            }
+        }
         try { if (pfd != null) pfd.close(); } catch (Exception ignored) { }
+        pfd = null;
 
-        if (ok) {
+        if (ok && fragments > 0) {
             ContentValues v = new ContentValues();
             v.put(MediaStore.Video.Media.IS_PENDING, 0);
             try { cr.update(uri, v, null, null); } catch (Exception ignored) { }
@@ -457,25 +555,98 @@ final class Recorder {
             }
         } else {
             try { if (uri != null) cr.delete(uri, null, null); } catch (Exception ignored) { }
-            log.log("Recording had no frames, so nothing was saved.");
+            log.log("Recording " + fileName + " had no frames, so nothing was saved.");
         }
-    }
-
-    private void releaseAudio() {
-        if (audio != null) {
-            try { audio.stop(); } catch (Exception ignored) { }
-            audio.release();
-            audio = null;
-        }
-        if (aenc != null) {
-            try { aenc.stop(); } catch (Exception ignored) { }
-            aenc.release();
-            aenc = null;
-        }
+        if (uri != null) ACTIVE.remove(uri.toString());
     }
 
     private static void join(Thread t) {
         if (t == null) return;
         try { t.join(3000); } catch (InterruptedException ignored) { }
+    }
+
+    // ------------------------------------------------------------------ rescue after a crash
+
+    /**
+     * Finds videos that were still being recorded when the app was killed (Android keeps
+     * them hidden as "pending"), tidies them and puts them in the gallery. Worker thread.
+     * @return how many were rescued
+     */
+    static int recoverUnfinished(Context ctx, Logger log) {
+        if (Build.VERSION.SDK_INT < 30) return 0;
+        ContentResolver cr = ctx.getContentResolver();
+        Bundle q = new Bundle();
+        q.putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_ONLY);
+        q.putString(ContentResolver.QUERY_ARG_SQL_SELECTION, MediaStore.Video.Media.RELATIVE_PATH + " LIKE ?");
+        q.putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, new String[]{Environment.DIRECTORY_MOVIES + "/EyeToyCam%"});
+        int rescued = 0;
+        try (Cursor c = cr.query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                new String[]{MediaStore.Video.Media._ID, MediaStore.Video.Media.DISPLAY_NAME}, q, null)) {
+            if (c == null) return 0;
+            while (c.moveToNext()) {
+                Uri u = android.content.ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, c.getLong(0));
+                String name = c.getString(1);
+                if (ACTIVE.contains(u.toString())) continue;
+                Fmp4Fixup.Result r = null;
+                try (ParcelFileDescriptor p = cr.openFileDescriptor(u, "rw")) {
+                    if (p != null) {
+                        FdIo io = new FdIo(p.getFileDescriptor());
+                        r = Fmp4Fixup.finish(io);
+                        io.sync();
+                    }
+                } catch (Exception e) {
+                    log.log("Couldn't check unfinished video " + name + ": " + e.getMessage());
+                }
+                if (r != null && r.durationMs > 0) {
+                    ContentValues v = new ContentValues();
+                    v.put(MediaStore.Video.Media.IS_PENDING, 0);
+                    try {
+                        cr.update(u, v, null, null);
+                        rescued++;
+                        log.log(String.format(Locale.US, "Rescued unfinished video Movies/EyeToyCam/%s (%.1f s).",
+                                name, r.durationMs / 1000.0));
+                    } catch (Exception e) {
+                        log.log("Couldn't publish rescued video " + name + ": " + e.getMessage());
+                    }
+                } else if (r != null) {
+                    try { cr.delete(u, null, null); } catch (Exception ignored) { }
+                    log.log("Unfinished video " + name + " had nothing playable, so it was removed.");
+                }
+            }
+        } catch (Exception e) {
+            log.log("Checking for unfinished videos failed: " + e.getMessage());
+        }
+        return rescued;
+    }
+
+    /** Reads and writes the file straight through its descriptor. */
+    private static final class FdIo implements Fmp4Writer.Io {
+        private final FileDescriptor fd;
+        FdIo(FileDescriptor fd) { this.fd = fd; }
+
+        @Override public void write(ByteBuffer b, long pos) throws IOException {
+            int before = b.position();
+            try {
+                int n = Os.pwrite(fd, b, pos);
+                if (b.position() == before) b.position(before + n);
+            } catch (android.system.ErrnoException e) { throw new IOException(e.getMessage()); }
+        }
+        @Override public int read(ByteBuffer b, long pos) throws IOException {
+            int before = b.position();
+            try {
+                int n = Os.pread(fd, b, pos);
+                if (n > 0 && b.position() == before) b.position(before + n);
+                return n;
+            } catch (android.system.ErrnoException e) { throw new IOException(e.getMessage()); }
+        }
+        @Override public long size() throws IOException {
+            try { return Os.fstat(fd).st_size; } catch (android.system.ErrnoException e) { throw new IOException(e.getMessage()); }
+        }
+        @Override public void truncate(long size) throws IOException {
+            try { Os.ftruncate(fd, size); } catch (android.system.ErrnoException e) { throw new IOException(e.getMessage()); }
+        }
+        @Override public void sync() throws IOException {
+            try { Os.fdatasync(fd); } catch (android.system.ErrnoException e) { throw new IOException(e.getMessage()); }
+        }
     }
 }

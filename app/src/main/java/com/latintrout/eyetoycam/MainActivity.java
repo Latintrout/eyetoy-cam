@@ -93,7 +93,18 @@ public class MainActivity extends Activity {
     private Prefs prefs;
     private final Look look = new Look();
     private volatile String mode = Prefs.MODE_VIDEO;
+    /** The main camera's video. While it runs, a recording is in progress. */
     private volatile Recorder recorder;
+    /** With several cameras: each other camera's own video, by slot (null when it isn't recording). */
+    private final Recorder[] sideRecs = new Recorder[IsoStream.MAX_SLOTS];
+    /** Optional video with every camera in one picture, and the cameras in it (main first). */
+    private volatile Recorder comboRec;
+    private volatile Cam[] comboCams = new Cam[0];
+    private volatile boolean comboPip;
+    /** True while other cameras feed a video, so they are decoded at full size. */
+    private volatile boolean recordingSides;
+    /** The microphone shared by every file of a recording (null when recording without sound). */
+    private volatile MicSource mic;
     private final WaveDetector wave = new WaveDetector();
     private final int[] zoneBuf = new int[WaveDetector.GX * WaveDetector.GY];
     private float lastRingCharge;
@@ -143,7 +154,7 @@ public class MainActivity extends Activity {
     private volatile Uri lastUri;
     private volatile boolean lastIsVideo;
     private volatile boolean rotating;
-    private volatile boolean lastWithSound, pendingSound;
+    private volatile boolean pendingSound;
     private volatile int recPart = 1;
     private SaveOverlay saveOverlay;
     private TextView logView, statusView;
@@ -201,6 +212,11 @@ public class MainActivity extends Activity {
         log("Plug the EyeToy in with the adapter, then tap Connect.");
 
         handleIntent(getIntent());
+        worker.execute(() -> {
+            int n = Recorder.recoverUnfinished(this, this::log);
+            if (n > 0) ui.post(() -> Toast.makeText(this, n == 1 ? "Rescued 1 unfinished video."
+                    : "Rescued " + n + " unfinished videos.", Toast.LENGTH_LONG).show());
+        });
     }
 
     @Override
@@ -785,11 +801,19 @@ public class MainActivity extends Activity {
         // ---- several cameras ----
         LinearLayout multi = Ps2Ui.section(this, settingsList, "Cameras");
         multi.addView(Ps2Ui.segmentRow(this, "Layout with more than one camera",
-                "Auto stacks two cameras and uses a 2\u00D72 grid for three or four. Free lets you drag each picture anywhere and resize it from its corner or by pinching. Tap a picture to make it the main camera (it records); double-tap to see it alone.",
+                "Auto stacks two cameras and uses a 2\u00D72 grid for three or four. Free lets you drag each picture anywhere and resize it from its corner or by pinching. Tap a picture to make it the main camera (it watches for waves and goes first in the combined video); double-tap to see it alone.",
                 new String[]{"Auto", "Stacked", "Grid", "Free"}, prefs.i("multi_layout", CamGrid.AUTO), i -> {
                     prefs.putI("multi_layout", i);
                     layoutTiles();
                 }));
+        multi.addView(Ps2Ui.segmentRow(this, "Record video from",
+                "Every camera saves its own video (_cam1, _cam2...), all with the same sound. Main camera records just the one you picked.",
+                new String[]{"Main camera", "Every camera"}, prefs.b("rec_all", true) ? 1 : 0,
+                i -> prefs.putB("rec_all", i == 1)));
+        multi.addView(Ps2Ui.segmentRow(this, "Also save a combined video",
+                "One more video with every camera in it. Grid gives each camera its own square at full size; Picture-in-picture shows the main camera big and the others small in the corner.",
+                new String[]{"Off", "Grid", "Pic-in-pic"}, prefs.i("rec_combo", 0),
+                i -> prefs.putI("rec_combo", i)));
         multi.addView(Ps2Ui.toggleRow(this, "Share USB bandwidth",
                 "Turn on if a second camera won't start through your hub. Every camera then uses a smaller stream at up to 10 fps. Restarts the cameras.",
                 prefs.b("usb_share", false), on -> {
@@ -1274,7 +1298,8 @@ public class MainActivity extends Activity {
                 if (rotating) ui.postDelayed(this, 200);   // between two parts of a split recording
                 return;
             }
-            float l = r.micLevel();
+            MicSource mc = mic;
+            float l = r.hasSound() && mc != null ? mc.level() : -1f;
             micMeter.setVisibility(l < 0 ? View.GONE : View.VISIBLE);
             if (l >= 0) micMeter.setLevel(l);
             ui.postDelayed(this, 80);
@@ -1553,7 +1578,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** One per camera. Every camera feeds its own picture; only the main one records, takes photos and sees waves. */
+    /** One per camera. Every camera feeds its own picture and, when set, its own video; the main one also sees waves and drives the combined video. */
     private void frameLoop(Cam c) {
         long lastStatus = 0, started = System.currentTimeMillis();
         int lastShown = 0;
@@ -1565,7 +1590,7 @@ public class MainActivity extends Activity {
             if (f != null) {
                 boolean isMain = c == main;
                 // side cameras are shown small, so half size is plenty and decodes faster
-                int sample = isMain || camList().size() < 2 ? 1 : 2;
+                int sample = isMain || recordingSides || camList().size() < 2 ? 1 : 2;
                 Bitmap bmp = decode(f, sample);
                 byte[] used = f;
                 if (bmp == null && JpegFix.looksLikeJpeg(f)) {
@@ -1578,6 +1603,7 @@ public class MainActivity extends Activity {
                 if (bmp != null) {
                     c.framesShown++;
                     c.lastJpeg = used;
+                    c.lastBmp = bmp;
                     if (!c.live) {
                         c.live = true;
                         log((camList().size() > 1 ? tag : "") + "First picture received! " + bmp.getWidth() + "x" + bmp.getHeight()
@@ -1591,17 +1617,28 @@ public class MainActivity extends Activity {
                         framesShown++;
                         Recorder rec = recorder;
                         if (rec != null && rec.isRunning()) {
+                            boolean due = true;
                             if (rec.isTimelapse()) {
                                 long every = TL_SECONDS[prefs.i("tl_idx", 2)] * 1000L;
-                                if (now - lastTlMs >= every) {
-                                    lastTlMs = now;
-                                    rec.drawFrame(bmp);
-                                }
-                            } else {
+                                due = now - lastTlMs >= every;
+                                if (due) lastTlMs = now;
+                            }
+                            if (due) {
                                 rec.drawFrame(bmp);
+                                Recorder combo = comboRec;
+                                if (combo != null && combo.isRunning()) drawCombo(combo);
                             }
                         }
                         if (prefs.b("wave", true) && !saveOverlay.isShowing() && !countingDown) detectWave(bmp, now);
+                    } else {
+                        Recorder sr = sideRecs[c.slot];
+                        if (sr != null && sr.isRunning()) {
+                            if (!sr.isTimelapse()) sr.drawFrame(bmp);
+                            else if (now - c.lastTlMs >= TL_SECONDS[prefs.i("tl_idx", 2)] * 1000L) {
+                                c.lastTlMs = now;
+                                sr.drawFrame(bmp);
+                            }
+                        }
                     }
                     final Bitmap show = Effects.render(bmp, look.effect, now);
                     ui.post(() -> {
@@ -1933,53 +1970,149 @@ public class MainActivity extends Activity {
             ui.post(() -> Toast.makeText(this, "Not enough free storage.", Toast.LENGTH_LONG).show());
             return;
         }
-        lastWithSound = withSound;
         recPart = 1;
-        Recorder r = openRecorder(withSound);
-        if (r == null) return;
-        recorder = r;
+        MicSource m = null;
+        if (withSound && !Prefs.MODE_TIMELAPSE.equals(mode)) {
+            m = new MicSource(this::log);
+            try {
+                m.start(this);
+            } catch (Exception e) {
+                log("Recording without sound: " + e.getMessage());
+                m = null;
+            }
+        }
+        mic = m;
+        if (!openSet()) {
+            if (m != null) m.stop();
+            mic = null;
+            return;
+        }
         RecordService.start(this);
         startLedBlink();
-        final boolean tl = r.isTimelapse();
+        final boolean tl = recorder.isTimelapse();
         ui.post(() -> {
             recSub.setText(tl ? "TIME-LAPSE" : "0:00");
             updateRecUi(true);
         });
     }
 
-    /** Opens a new video file and starts it recording. Returns null (and logs why) if it can't. */
-    private Recorder openRecorder(boolean withSound) {
+    private String labelOf(Cam c) {
+        return prefs.s("label_" + c.key(), "EyeToy");
+    }
+
+    /**
+     * Opens every file of one recording part: the main camera's, and with several cameras
+     * (depending on Settings > Cameras) one per other camera and the combined one.
+     * Sets {@link #recorder} last, so the recording only counts as running once all are open.
+     */
+    private boolean openSet() {
+        Cam m = main;
+        if (m == null) return false;
+        java.util.List<Cam> list = camList();
+        boolean multi = list.size() > 1;
+        boolean all = multi && prefs.b("rec_all", true);
+        int combo = multi ? prefs.i("rec_combo", 0) : 0;
+        String when = stamp();
+        lastTlMs = 0;
+        Recorder r = openRecorder(m, when, all ? "_cam" + m.number() : "", 640, 480, labelOf(m), m.sensorName);
+        if (r == null) return false;
+        if (all) {
+            for (Cam c : list) {
+                if (c == m) continue;
+                c.lastTlMs = 0;
+                Recorder sr = openRecorder(c, when, "_cam" + c.number(), 640, 480, labelOf(c), c.sensorName);
+                if (sr == null) log("Cam " + c.number() + ": its own video couldn't start; the others carry on.");
+                sideRecs[c.slot] = sr;
+            }
+        }
+        if (combo > 0) {
+            java.util.List<Cam> order = new java.util.ArrayList<>();
+            order.add(m);
+            for (Cam c : list) if (c != m) order.add(c);
+            boolean pip = combo == 2;
+            int n = order.size();
+            int w = pip ? 640 : 1280, h = pip ? 480 : (n <= 2 ? 480 : 960);
+            comboCams = order.toArray(new Cam[0]);
+            comboPip = pip;
+            comboRec = openRecorder(null, when, pip ? "_pip" : "_grid", w, h, labelOf(m), m.sensorName);
+            if (comboRec == null) log("The combined video couldn't start; the camera videos carry on.");
+        }
+        recordingSides = all || combo > 0;
+        recorder = r;
+        return true;
+    }
+
+    /** Opens one video file and starts it recording. c is null for the combined video. Returns null (and logs why) if it can't. */
+    private Recorder openRecorder(Cam c, String when, String suffix, int w, int h, String label, String sensor) {
         boolean tl = Prefs.MODE_TIMELAPSE.equals(mode);
-        String label = currentLabel();
-        String base = Metadata.baseName(label, stamp());
+        String base = Metadata.baseName(c == null ? "EyeToy" : label, when) + suffix;
         int fps = tl ? TL_OUT_FPS : prefs.fps();
-        String desc = Metadata.description(label, sensorName, 640, 480, fps, tl);
-        Recorder r = new Recorder(this::log);
+        String desc = c == null
+                ? "Sony EyeToy (PS2) USB cameras - " + comboCams.length + " cameras in one " + (comboPip ? "picture-in-picture" : "grid")
+                        + " video, " + w + "x" + h + ", " + fps + " fps"
+                : Metadata.description(label, sensor, 640, 480, fps, tl);
+        Recorder r = new Recorder(c == null ? this::log : msg -> log(camList().size() > 1 ? "Cam " + c.number() + ": " + msg : msg));
         try {
-            r.start(this, 640, 480, fps, withSound, look, base, desc, tl, TL_OUT_FPS,
+            r.start(this, w, h, fps, mic, look, base, desc, tl, TL_OUT_FPS,
                     prefs.b("hud_video", false), label);
-            lastTlMs = 0;
             return r;
         } catch (Exception e) {
-            log("Couldn't start recording: " + e.getMessage());
+            log("Couldn't start recording " + base + ": " + e.getMessage());
             Log.e(TAG, "startRecording", e);
             r.stop();
             return null;
         }
     }
 
-    /** Runs on the worker thread. Finishes this part and carries straight on into a new file. */
+    /** Draws the combined video's next frame from every camera's newest picture. Main camera's frame thread. */
+    private void drawCombo(Recorder combo) {
+        Cam[] cc = comboCams;
+        android.graphics.Bitmap[] b = new android.graphics.Bitmap[cc.length];
+        String[] labels = new String[cc.length];
+        for (int i = 0; i < cc.length; i++) {
+            Cam c = cc[i];
+            b[i] = c.running ? c.lastBmp : null;
+            labels[i] = "CAM " + c.number() + " \u00B7 " + labelOf(c).toUpperCase(Locale.US);
+        }
+        combo.drawComposite(b, labels, comboPip);
+    }
+
+    /** Takes every running file of the recording out of play (main last) and returns them. */
+    private java.util.List<Recorder> takeAll() {
+        java.util.List<Recorder> out = new java.util.ArrayList<>();
+        Recorder r = recorder;
+        recorder = null;
+        for (int i = 0; i < sideRecs.length; i++) {
+            if (sideRecs[i] != null) out.add(sideRecs[i]);
+            sideRecs[i] = null;
+        }
+        if (comboRec != null) out.add(comboRec);
+        comboRec = null;
+        recordingSides = false;
+        if (r != null) out.add(0, r);
+        return out;
+    }
+
+    /** Finishes the files; returns how many were saved. The main one (first) becomes the thumbnail. */
+    private int finishAll(java.util.List<Recorder> recs) {
+        int saved = 0;
+        for (Recorder r : recs) {
+            r.stop();
+            if (r.savedUri() != null) saved++;
+        }
+        if (!recs.isEmpty() && recs.get(0).savedUri() != null) setLast(recs.get(0).savedUri(), true);
+        return saved;
+    }
+
+    /** Runs on the worker thread. Finishes this part and carries straight on into new files. */
     private void rotateRecording() {
         try {
-            Recorder old = recorder;
-            if (old == null || !old.isRunning()) return;
-            recorder = null;
-            old.stop();
-            Uri saved = old.savedUri();
-            if (saved != null) setLast(saved, true);
-            Recorder next = (streaming && freeBytes() >= MIN_FREE_BYTES) ? openRecorder(lastWithSound) : null;
-            if (next == null) {
+            if (!isRecording()) return;
+            finishAll(takeAll());
+            boolean next = streaming && freeBytes() >= MIN_FREE_BYTES && openSet();
+            if (!next) {
                 log("Couldn't carry on into a new file, so the recording has ended.");
+                stopMic();
                 stopLedBlink();
                 RecordService.stop(this);
                 ui.post(() -> {
@@ -1989,30 +2122,45 @@ public class MainActivity extends Activity {
                 return;
             }
             recPart++;
-            recorder = next;
         } finally {
             rotating = false;
         }
     }
 
+    private void stopMic() {
+        MicSource m = mic;
+        mic = null;
+        if (m != null) m.stop();
+    }
+
     /** Runs on the worker thread. */
     private void stopRecording() {
-        Recorder r = recorder;
-        recorder = null;
-        if (r == null) return;
+        java.util.List<Recorder> recs = takeAll();
+        if (recs.isEmpty()) {
+            stopMic();
+            return;
+        }
         stopLedBlink();
+        final int files = recs.size();
         ui.post(() -> {
-            saveOverlay.showSaving("Saving data...", "Do not unplug the EyeToy.");
+            saveOverlay.showSaving(files > 1 ? "Saving " + files + " videos..." : "Saving data...", "Do not unplug the EyeToy.");
             updateRecUi(false);
         });
-        r.stop();
+        int saved = finishAll(recs);
+        stopMic();
         RecordService.stop(this);
-        final String name = r.savedName();
-        if (r.savedUri() != null) setLast(r.savedUri(), true);
+        final int n = saved;
         ui.post(() -> {
-            if (name != null) saveOverlay.showDone("Movies / EyeToyCam");
+            if (n > 0) saveOverlay.showDone("Movies / EyeToyCam");
             else saveOverlay.showFail("The recording had no pictures.");
         });
+    }
+
+    /** Runs on the worker thread. Stops just one other camera's video (that camera went away). */
+    private void stopSideRecording(Cam c) {
+        Recorder r = sideRecs[c.slot];
+        sideRecs[c.slot] = null;
+        if (r != null) r.stop();
     }
 
     // ------------------------------------------------------------------ last photo / video
@@ -2093,6 +2241,8 @@ public class MainActivity extends Activity {
             stopLedBlink();
         }
         c.running = false;
+        c.lastBmp = null;
+        if (c != main) stopSideRecording(c);
         if (c.thread != null && c.thread != Thread.currentThread()) {
             try { c.thread.join(1000); } catch (InterruptedException ignored) { }
         }
